@@ -385,10 +385,30 @@ sv1 <- sv %>%
                                            calf_milk_sources != "Powdered milk replacer", 0,
                                          milk_replacer_prt_pcnt)) %>% 
   
+  
+  # Farms that do not use milk replacer are not differentiated on the question whether milk replacer
+  # is medicated.Changing that
+  mutate(milk_replacer_medicated_ind = as.character(milk_replacer_medicated_ind)) %>% 
+  mutate(milk_replacer_medicated_ind = ifelse(!is.na(calf_milk_sources) & 
+                                           calf_milk_sources != "Powdered milk replacer", 
+                                           "No milk replacer", milk_replacer_medicated_ind)) %>% 
+  
   # There are farms which responded more than you type of bedding. Combining both into a single
   # variable 
-  unite(calf_bedding_type, calf_bedding_type_1, calf_bedding_type_2,
+  unite(col = calf_bedding_type, 
+        calf_bedding_type_1, calf_bedding_type_2,
         na.rm = TRUE, remove = TRUE) %>% 
+  
+  
+  # Combining both non-weaned and weaned housing information into one single variable 
+  unite(col = noweaned_housing,
+        noweaned_housing_groupings, noweaned_housing_details,
+        na.rm = TRUE, remove = TRUE) %>% 
+  unite(col = weaned_housing,
+        weaned_housing_groupings, weaned_housing_details,
+        na.rm = TRUE, remove = TRUE) %>% 
+  
+  
   # There are some empty cells, converting those to NA
   na_if("") %>% 
   
@@ -466,6 +486,13 @@ sv2 %>%
 # Looking at the numerical variables
 sv2 %>% 
   DataExplorer::plot_histogram()
+
+
+# There seem to be a problem with bedding change frequency. Some farms answered adding bedding
+# 3, 4, and 7 time per day, which seems a little too much! It could be a mistake in selecting the 
+# correct frequency unit (i.e., maybe they meant 7 times per week for example) or it could be that 
+# they check on calves multiple times per day and they add bedding if it is needed. Since there is 
+# no way a could confirm that, I will leave that variable like that.
 
 
 # Looking at correlations
@@ -686,15 +713,16 @@ valid.mclust %>%
 
 
 
-# Normal mixture models with 2 clusters was the best option!
+# Hierarchical with 2 clusters was the best option!
+
 
 ## Clustering ####
 
 set.seed(1801)
-sv.cluster <- distnoisemclustCBI(dmatrix = clust.dist,
+sv.cluster <- disthclustCBI(dmatrix = as.dist(clust.dist),
                                  k = 2,
-                                 diss = TRUE)
-
+                                 diss = TRUE,
+                            method = "ward.D2")
 
 
 
@@ -702,13 +730,18 @@ sv.cluster <- distnoisemclustCBI(dmatrix = clust.dist,
 cluster_mds <- cmdscale(d = as.dist(clust.dist),
                         k = 2, # First two dimensions
                         eig = TRUE)
-                        
+
+
+
+
+# Visualizing the cluster results on nlPCA loads
 
 ggplot(mapping = aes(x = cluster_mds$points[,1],
                      y = cluster_mds$points[,2],
                      color = factor(sv.cluster$partition),
                      shape = factor(sv.cluster$partition))) +
-  geom_point() + 
+  geom_point(position = position_jitter(h = 0.2, w=0.05, seed = 1801),
+             alpha = 0.6, size = 0.8) + 
   scale_color_manual(values = c("#1F78B4", "#FF7F00")) +
   
   theme_bw(base_family = "Times New Roman") +
@@ -716,11 +749,10 @@ ggplot(mapping = aes(x = cluster_mds$points[,1],
        y = "MDS2",
        shape = "Cluster",
        colour = "Cluster") +
-  scale_x_continuous(expand = expansion(mult = c(0.02, 0.06))) +
 
   theme(axis.text = element_text(size = 10, color = "black"),
         legend.text = element_text(size = 10, family = "Times New Roman"),
-        legend.position = c(0.91, 0.84),
+        legend.position = c(0.91, 0.812),
         legend.background = element_rect(fill = "white", color = "black"),
         legend.justification="center",
         axis.title.x = element_text(size = 10, 
@@ -734,7 +766,6 @@ ggplot(mapping = aes(x = cluster_mds$points[,1],
                                                     b = 0, # bottom
                                                     l = 0)),
         legend.title.align = 0.5)
-
 
 
 table(sv.cluster$partition)
@@ -768,7 +799,7 @@ densityplot(sv.imputed)
 sv.cluster.desc <- FactoMineR::catdes(donnee = sv.imputed %>% 
                                         mice::complete("long") %>% 
                                         select(-.id, -.imp),
-                                      num.var = 34,
+                                      num.var = 32,
                                       proba = 0.05)
 
 
@@ -959,10 +990,11 @@ wd.lpl.imputed.stats <- wd.imputed %>%
   
   # Some levels on colostrum system and milk source are too low (e.g., Only 1 farm said "No colostrum")
   # Therefore, I will remove those levels
-  filter(!(colostrum_sys %in% c("No colostrum offered", 
-                                "Other")), 
+  filter(!(colostrum_sys %in% c("No colostrum offered",
+                                "Other")),
          !(calf_milk_source_forms %in% c("Pasteurized / Acidified",
-                                         "Non pasturized / Acidified"))) %>% 
+                                         "Non pasturized / Acidified")),
+         !(colostrum_sources %in% c("Other"))) %>%
   droplevels() %>%
   
   
@@ -970,10 +1002,9 @@ wd.lpl.imputed.stats <- wd.imputed %>%
   select(c(.imp, lpl, 
            
            # Categorical variables
-           "weaned_housing_details", "colostrum_sys", "calf_milk_source_forms", 
-           "calf_milk_sources", "calf_milk_feed_sys", "noweaned_housing_groupings", 
-           "milk_replacer_medicated_ind", "noweaned_housing_details", 
-           "weaned_housing_groupings", "igg_conc_method",
+           "milk_replacer_medicated_ind", "calf_milk_source_forms", "calf_milk_sources",
+           "calf_milk_feed_sys", "noweaned_housing", "weaned_housing", "igg_conc_method",
+           "colostrum_sys", "colostrum_sources",
            
            # Numeric variables
            "first_concentrate_age_days", "bdng_added_fqcy", "first_water_age_days", 
@@ -988,10 +1019,11 @@ wd.lact3plus.imputed.stats <- wd.imputed %>%
   
   # Some levels on colostrum system and milk source are too low (e.g., Only 1 farm said "No colostrum")
   # Therefore, I will remove those levels
-  filter(!(colostrum_sys %in% c("No colostrum offered", 
-                                "Other")), 
+  filter(!(colostrum_sys %in% c("No colostrum offered",
+                                "Other")),
          !(calf_milk_source_forms %in% c("Pasteurized / Acidified",
-                                         "Non pasturized / Acidified"))) %>% 
+                                         "Non pasturized / Acidified")),
+         !(colostrum_sources %in% c("Other"))) %>%
   droplevels() %>%
   
   
@@ -999,10 +1031,9 @@ wd.lact3plus.imputed.stats <- wd.imputed %>%
   select(c(.imp, lact3plus, 
            
            # Categorical variables
-           "weaned_housing_details", "colostrum_sys", "calf_milk_source_forms", 
-           "calf_milk_sources", "calf_milk_feed_sys", "noweaned_housing_groupings", 
-           "milk_replacer_medicated_ind", "noweaned_housing_details", 
-           "weaned_housing_groupings", "igg_conc_method",
+           "milk_replacer_medicated_ind", "calf_milk_source_forms", "calf_milk_sources",
+           "calf_milk_feed_sys", "noweaned_housing", "weaned_housing", "igg_conc_method",
+           "colostrum_sys", "colostrum_sources",
            
            # Numeric variables
            "first_concentrate_age_days", "bdng_added_fqcy", "first_water_age_days", 
@@ -1017,10 +1048,11 @@ wd.ecm.imputed.stats <- wd.imputed %>%
   
   # Some levels on colostrum system and milk source are too low (e.g., Only 1 farm said "No colostrum")
   # Therefore, I will remove those levels
-  # filter(!(colostrum_sys %in% c("No colostrum offered", 
-  #                               "Other")), 
-  #        !(calf_milk_source_forms %in% c("Pasteurized / Acidified",
-  #                                        "Non pasturized / Acidified"))) %>% 
+  filter(!(colostrum_sys %in% c("No colostrum offered",
+                                "Other")),
+         !(calf_milk_source_forms %in% c("Pasteurized / Acidified",
+                                         "Non pasturized / Acidified")),
+         !(colostrum_sources %in% c("Other"))) %>%
   droplevels() %>%
   
   
@@ -1028,10 +1060,9 @@ wd.ecm.imputed.stats <- wd.imputed %>%
   select(c(.imp, ecm, 
            
            # Categorical variables
-           "weaned_housing_details", "colostrum_sys", "calf_milk_source_forms", 
-           "calf_milk_sources", "calf_milk_feed_sys", "noweaned_housing_groupings", 
-           "milk_replacer_medicated_ind", "noweaned_housing_details", 
-           "weaned_housing_groupings", "igg_conc_method",
+           "milk_replacer_medicated_ind", "calf_milk_source_forms", "calf_milk_sources",
+           "calf_milk_feed_sys", "noweaned_housing", "weaned_housing", "igg_conc_method",
+           "colostrum_sys", "colostrum_sources",
            
            # Numeric variables
            "first_concentrate_age_days", "bdng_added_fqcy", "first_water_age_days", 
@@ -1046,10 +1077,11 @@ wd.cumul_milk_value.imputed.stats <- wd.imputed %>%
   
   # Some levels on colostrum system and milk source are too low (e.g., Only 1 farm said "No colostrum")
   # Therefore, I will remove those levels
-  filter(!(colostrum_sys %in% c("No colostrum offered", 
-                                "Other")), 
+  filter(!(colostrum_sys %in% c("No colostrum offered",
+                                "Other")),
          !(calf_milk_source_forms %in% c("Pasteurized / Acidified",
-                                         "Non pasturized / Acidified"))) %>% 
+                                         "Non pasturized / Acidified")),
+         !(colostrum_sources %in% c("Other"))) %>%
   droplevels() %>%
   
   
@@ -1057,16 +1089,15 @@ wd.cumul_milk_value.imputed.stats <- wd.imputed %>%
   select(c(.imp, cumul_milk_value, 
            
            # Categorical variables
-           "weaned_housing_details", "colostrum_sys", "calf_milk_source_forms", 
-           "calf_milk_sources", "calf_milk_feed_sys", "noweaned_housing_groupings", 
-           "milk_replacer_medicated_ind", "noweaned_housing_details", 
-           "weaned_housing_groupings", "igg_conc_method",
+           "milk_replacer_medicated_ind", "calf_milk_source_forms", "calf_milk_sources",
+           "calf_milk_feed_sys", "noweaned_housing", "weaned_housing", "igg_conc_method",
+           "colostrum_sys", "colostrum_sources",
            
            # Numeric variables
            "first_concentrate_age_days", "bdng_added_fqcy", "first_water_age_days", 
            "starter_feed_prot_pcnts", "daily_feeding_amnt", "milk_replacer_fat_pcnt", 
            "milk_replacer_prt_pcnt"))
-
+           
 
 # Length of productive Life ------------------------------------------------
 
@@ -1214,7 +1245,7 @@ for(i in 1:10) {
   set.seed(1801)
   tree_lpl <- train(lpl ~ ., 
                     data = data, 
-                    method = "rpart2",
+                    method = "rpart",
                     trControl = fit_control)
   
   lpl.tree.models[[i]] <- tree_lpl
@@ -1462,16 +1493,6 @@ ggplot(var.imp.lpl %>%
          group_by(feature) %>% 
          summarise(avg = mean(importance),
                    sd = sd(importance)) %>% 
-         
-         # mutate(feature = recode(feature, serum_IgG_infrared = "Serum IgG",
-         #                         scours = "Scours",
-         #                         pneumonia = "Pneumonia",
-         #                         navel_inf = "Navel infection",
-         #                         hrd_id = "Herd",
-         #                         birth_year = "Birth year",
-         #                         birht_weight = "Birth weight",
-         #                         birth_season = "Birth season",
-         #                         antib_treat = "Antibiotic treatment")) %>%
          arrange(desc(avg)),
        aes(y = reorder(feature, + avg),
            x = avg)) +
@@ -1479,9 +1500,6 @@ ggplot(var.imp.lpl %>%
   geom_errorbar(aes(xmin = avg - sd, xmax = avg + sd), 
                 width = 0.2) +
   theme_classic(base_family = "Times New Roman") + 
-  # scale_x_continuous(expand = expansion(mult = c(0, 0)),
-  #                    breaks = seq(1, 1.10, by = 0.02),
-  #                    limits = c(0.998, 1.1)) +
   labs(x = "Variable importance") +
   theme_classic(base_family = "Times New Roman") +
   theme(axis.text = element_text(size = 10, color = "black"),
@@ -1521,10 +1539,6 @@ for(i in 1:10) {
   
   
 }
-
-
-# ale.lpl.res[[1]] %>%
-#   plot()
 
 
 
@@ -1696,7 +1710,7 @@ for(i in 1:10) {
   set.seed(1801)
   tree_lact3plus <- train(lact3plus ~ ., 
                           data = data, 
-                          method = "rpart2",
+                          method = "rpart",
                           trControl = fit_control)
   
   lact3plus.tree.models[[i]] <- tree_lact3plus
@@ -1822,16 +1836,12 @@ res.lact3plus <- data.frame()
 for(i in 1:10) {
   
   res.lact3plus <- rbind(res.lact3plus, 
-                         
-                         # Decision tree model did not train (5 fold generated splits
-                         # where there were too little data on some levels)
-                         
-                         # ModelEvaluation(models = lact3plus.tree.models,
-                         #                 target.variable = "lact3plus",
-                         #                 train.data = wd.lact3plus.imput.train.split,
-                         #                 validation.data = wd.lact3plus.imput.val.split,
-                         #                 model.name = "ctree",
-                         #                 imputation = i)) %>%
+                         ModelEvaluation(models = lact3plus.tree.models,
+                                         target.variable = "lact3plus",
+                                         train.data = wd.lact3plus.imput.train.split,
+                                         validation.data = wd.lact3plus.imput.val.split,
+                                         model.name = "ctree",
+                                         imputation = i)) %>%
     
     ModelEvaluation(models = lact3plus.gbm.models,
                           target.variable = "lact3plus",
@@ -1890,7 +1900,7 @@ res.lact3plus %>%
 
 
 
-# Random Forest was the best model!
+# Decision tree was the best model!
 
 
 ## Model interpretation ------------------------------------------------------
@@ -1902,7 +1912,7 @@ predictors.lact3plus <- list()
 for(i in 1:10) {
   
   plan("callr", workers = 14)
-  predictor <- Predictor$new(model = lact3plus.rf.models[[i]], 
+  predictor <- Predictor$new(model = lact3plus.tree.models[[i]], 
                              data = wd.lact3plus.imputed.stats %>% 
                                filter(.imp == i) %>% 
                                select(-.imp),
@@ -1950,16 +1960,6 @@ ggplot(var.imp.lact3plus %>%
          group_by(feature) %>% 
          summarise(avg = mean(importance),
                    sd = sd(importance)) %>% 
-         
-         # mutate(feature = recode(feature, serum_IgG_infrared = "Serum IgG",
-         #                         scours = "Scours",
-         #                         pneumonia = "Pneumonia",
-         #                         navel_inf = "Navel infection",
-         #                         hrd_id = "Herd",
-         #                         birth_year = "Birth year",
-         #                         birht_weight = "Birth weight",
-         #                         birth_season = "Birth season",
-         #                         antib_treat = "Antibiotic treatment")) %>%
          arrange(desc(avg)),
        aes(y = reorder(feature, + avg),
            x = avg)) +
@@ -1967,9 +1967,6 @@ ggplot(var.imp.lact3plus %>%
   geom_errorbar(aes(xmin = avg - sd, xmax = avg + sd), 
                 width = 0.2) +
   theme_classic(base_family = "Times New Roman") + 
-  # scale_x_continuous(expand = expansion(mult = c(0, 0)),
-  #                    breaks = seq(1, 1.10, by = 0.02),
-  #                    limits = c(0.998, 1.1)) +
   labs(x = "Variable importance") +
   theme_classic(base_family = "Times New Roman") +
   theme(axis.text = element_text(size = 10, color = "black"),
@@ -2009,11 +2006,6 @@ for(i in 1:10) {
   
   
 }
-
-
-# ale.lact3plus.res[[1]] %>% 
-#   plot()
-
 
 
 ale.lact3plus.res.compiled <- data.frame()
@@ -2183,7 +2175,7 @@ for(i in 1:10) {
   set.seed(1801)
   tree_ecm <- train(ecm ~ ., 
                     data = data, 
-                    method = "rpart2",
+                    method = "rpart",
                     trControl = fit_control)
   
   ecm.tree.models[[i]] <- tree_ecm
@@ -2432,16 +2424,6 @@ ggplot(var.imp.ecm %>%
          group_by(feature) %>%
          summarise(avg = mean(importance),
                    sd = sd(importance)) %>%
-         
-         # mutate(feature = recode(feature, serum_IgG_infrared = "Serum IgG",
-         #                         scours = "Scours",
-         #                         pneumonia = "Pneumonia",
-         #                         navel_inf = "Navel infection",
-         #                         hrd_id = "Herd",
-         #                         birth_year = "Birth year",
-         #                         birht_weight = "Birth weight",
-         #                         birth_season = "Birth season",
-         #                         antib_treat = "Antibiotic treatment")) %>%
          arrange(desc(avg)),
        aes(y = reorder(feature, + avg),
            x = avg)) +
@@ -2449,9 +2431,6 @@ ggplot(var.imp.ecm %>%
   geom_errorbar(aes(xmin = avg - sd, xmax = avg + sd),
                 width = 0.2) +
   theme_classic(base_family = "Times New Roman") +
-  # scale_x_continuous(expand = expansion(mult = c(0, 0)),
-  #                    breaks = seq(1, 1.10, by = 0.02),
-  #                    limits = c(0.998, 1.1)) +
   labs(x = "Variable importance") +
   theme_classic(base_family = "Times New Roman") +
   theme(axis.text = element_text(size = 10, color = "black"),
@@ -2492,9 +2471,6 @@ for(i in 1:10) {
   
 }
 
-
-# ale.ecm.res[[1]] %>%
-#   plot()
 
 
 
@@ -2665,7 +2641,7 @@ for(i in 1:10) {
   set.seed(1801)
   tree_cumul_milk_value <- train(cumul_milk_value ~ ., 
                                  data = data, 
-                                 method = "rpart2",
+                                 method = "rpart",
                                  trControl = fit_control)
   
   cumul_milk_value.tree.models[[i]] <- tree_cumul_milk_value
@@ -2915,16 +2891,6 @@ ggplot(var.imp.cumul_milk_value %>%
          group_by(feature) %>%
          summarise(avg = mean(importance),
                    sd = sd(importance)) %>%
-         
-         # mutate(feature = recode(feature, serum_IgG_infrared = "Serum IgG",
-         #                         scours = "Scours",
-         #                         pneumonia = "Pneumonia",
-         #                         navel_inf = "Navel infection",
-         #                         hrd_id = "Herd",
-         #                         birth_year = "Birth year",
-         #                         birht_weight = "Birth weight",
-         #                         birth_season = "Birth season",
-         #                         antib_treat = "Antibiotic treatment")) %>%
          arrange(desc(avg)),
        aes(y = reorder(feature, + avg),
            x = avg)) +
@@ -2932,9 +2898,6 @@ ggplot(var.imp.cumul_milk_value %>%
   geom_errorbar(aes(xmin = avg - sd, xmax = avg + sd),
                 width = 0.2) +
   theme_classic(base_family = "Times New Roman") +
-  # scale_x_continuous(expand = expansion(mult = c(0, 0)),
-  #                    breaks = seq(1, 1.10, by = 0.02),
-  #                    limits = c(0.998, 1.1)) +
   labs(x = "Variable importance") +
   theme_classic(base_family = "Times New Roman") +
   theme(axis.text = element_text(size = 10, color = "black"),
@@ -2974,10 +2937,6 @@ for(i in 1:10) {
   
   
 }
-
-
-# ale.cumul_milk_value.res[[1]] %>%
-#   plot()
 
 
 
