@@ -1,1 +1,1 @@
-# early_pract_longevity
+This repository contain the R Code used characterize Quebec dairy farms based on their early life management practices and analyze the association between management practices and herd longevity, productivity, and profitability.
