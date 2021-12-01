@@ -1,1 +1,1 @@
-This repository contain the R Code used characterize Quebec dairy farms based on their early life management practices and analyze the association between management practices and herd longevity, productivity, and profitability.
+This repository contain the R Code used to characterize Quebec dairy farms based on their early life management practices using clustering analysis and to analyze the association between management practices and herd longevity, productivity, and profitability using machine learning models.
