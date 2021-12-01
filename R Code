@@ -1,0 +1,3329 @@
+# Calf survey project
+
+# Objectives:
+# 1 -> Characterize early life management practices
+# 2 -> Evaluate the relationship with profit, production, and longevity
+
+
+# Loading packages --------------------------------------------------------
+extrafont::loadfonts(device = "win")
+
+require(tidyverse)
+require(tidylog)
+require(mice)
+require(fpc) # Cluster validation
+require(caret)
+require(Metrics)
+require(doParallel)
+require(doSNOW)
+require(cowplot)
+require(iml)
+require(future)
+require(future.callr)
+
+
+# Helping functions -------------------------------------------------------
+
+# Function to calculate the Mean arctangent absolute percentage error as proposed
+# by Kim & Kim (2016) DOI: https://doi.org/10.1016/j.ijforecast.2015.12.003
+MAAPE <- function(obs, pred){
+  
+  
+  
+  return(mean(atan(abs(obs - pred)/abs(obs))))
+  
+}
+
+ModelEvaluation <- function(models,
+                            target.variable,
+                            train.data,
+                            validation.data,
+                            model.name,
+                            imputation) {
+  
+  # Training data set
+  
+  r2.train <- R2(pred = predict(models[[imputation]], 
+                                train.data %>% 
+                                  filter(.imp == imputation)),
+                 obs = train.data %>% 
+                   filter(.imp == imputation) %>% 
+                   pull(target.variable),
+                 formula = "corr")
+  
+  mae.train <- MAE(pred = predict(models[[imputation]], 
+                                  train.data %>% 
+                                    filter(.imp == imputation)),
+                   obs = train.data %>% 
+                     filter(.imp == imputation) %>% 
+                     pull(target.variable))
+  
+  rmse.train <- RMSE(pred = predict(models[[imputation]], 
+                                    train.data %>% 
+                                      filter(.imp == imputation)),
+                     obs = train.data %>% 
+                       filter(.imp == imputation) %>% 
+                       pull(target.variable))
+  
+  
+  maape.train <- MAAPE(pred = predict(models[[imputation]], 
+                                      train.data %>% 
+                                        filter(.imp == imputation)),
+                       obs = train.data %>% 
+                         filter(.imp == imputation) %>% 
+                         pull(target.variable)) * 100
+  
+  
+  # Validation data set
+  
+  r2.val <- R2(pred = predict(models[[imputation]], 
+                              validation.data %>% 
+                                filter(.imp == imputation)),
+               obs = validation.data %>% 
+                 filter(.imp == imputation) %>% 
+                 pull(target.variable),
+               formula = "corr")
+  
+  mae.val <- MAE(pred = predict(models[[imputation]], 
+                                validation.data %>% 
+                                  filter(.imp == imputation)),
+                 obs = validation.data %>% 
+                   filter(.imp == imputation) %>% 
+                   pull(target.variable))
+  
+  rmse.val <- RMSE(pred = predict(models[[imputation]], 
+                                  validation.data %>% 
+                                    filter(.imp == imputation)),
+                   obs = validation.data %>% 
+                     filter(.imp == imputation) %>% 
+                     pull(target.variable))
+  
+  maape.val <- MAAPE(pred = predict(models[[imputation]], 
+                                    validation.data %>% 
+                                      filter(.imp == imputation)),
+                     obs = validation.data %>% 
+                       filter(.imp == imputation) %>% 
+                       pull(target.variable)) * 100
+                       
+  res <- tibble(imputation = imputation,
+                model = model.name,
+                data.set = c(rep("training", 4), rep("validation", 4)),
+                metric = rep(c("r2", "MAE", "RMSE", "MAAPE"), 2),
+                value = c(r2.train, mae.train, rmse.train, maape.train,
+                          r2.val, mae.val, rmse.val, maape.val))
+  
+  return(res)
+  
+}
+
+getSeason <- function(DATES) {
+  WS <- as.Date("2012-12-15", format = "%Y-%m-%d") # Winter Solstice
+  SE <- as.Date("2012-3-15",  format = "%Y-%m-%d") # Spring Equinox
+  SS <- as.Date("2012-6-15",  format = "%Y-%m-%d") # Summer Solstice
+  FE <- as.Date("2012-9-15",  format = "%Y-%m-%d") # Fall Equinox
+  
+  # Convert dates from any year to 2012 dates
+  d <- as.Date(strftime(DATES, format="2012-%m-%d"))
+  
+  factor(ifelse (d >= WS | d < SE, "Winter",
+                 ifelse (d >= SE & d < SS, "Spring",
+                         ifelse (d >= SS & d < FE, "Summer", "Fall"))),
+         levels = c("Winter", "Spring", "Summer", "Fall"))
+}
+
+
+
+# Reading data ------------------------------------------------------------
+
+
+pa <- readRDS(paste(data.path, "proAction_anon_hrd_tbl.rds", sep = ""))
+lpl <- readRDS(paste(data.path, "prod_lifetime_anon_anm_tbl.rds", sep = ""))
+research_data <- readRDS(paste(data.path, "res_data_anon_anm_tbl.rds", sep = ""))
+survey <- readRDS(paste(data.path, "survey_calf_feed_anon_tbl.rds", sep = ""))
+hsi <- readRDS(paste(data.path, "whi_indicators_anon_tbl.rds", sep = ""))
+
+
+# Creating a more readable herd ID
+
+unique_hrd_id <- pa %>% 
+  select(id) %>% 
+  drop_na() %>% 
+  rbind(lpl %>% select(id),
+        research_data %>% select(id),
+        survey %>% select(id),
+        hsi %>%  select(id)) %>% 
+  distinct(id) %>% 
+  mutate(hrd_id = seq_along(id))
+
+
+
+# Preparing data ----------------------------------------------------------
+
+## proAction data ####
+# Replacing herd ids and doing the same cleanings as the proAction study (https://github.com/CowLifeMcGill/proAction_Sustainability)
+
+pa1 <- pa %>% 
+  
+  # Assigning a more readable herd ID
+  drop_na(id) %>% 
+  left_join(unique_hrd_id, by = "id") %>% 
+  select(hrd_id, setdiff(names(pa), c("id"))) %>% 
+  
+  # Removing duplicated observations
+  mutate(visit_date = as.Date(visit_date, format = "%B %d, %Y")) %>% 
+  group_by(hrd_id, visit_date) %>%
+  add_count() %>%
+  ungroup() %>%
+  filter(n == 1) %>%
+  
+  # Keeping the most recent
+  group_by(hrd_id) %>% 
+  arrange(desc(visit_date), .by_group = TRUE) %>% 
+  mutate(n = row_number()) %>% 
+  ungroup() %>% 
+  filter(n == 1) %>% 
+  select(-n) %>% 
+  
+  
+  # Welfare responses indicate the percentage of animals where the welfare measure
+  # was not an issue. This could be harder to understand. So I will convert it to indicate 
+  # the percentage of animals where the welfare measure indicated an issue.
+  # Also calculating season of the assessment
+  
+  mutate(season = getSeason(visit_date),
+         year = lubridate::year(visit_date),
+         BCS = 100 - bcs_percent,
+         HOCK = 100 - hock_percent,
+         KNEE = 100- knee_percent, 
+         NECK = 100 - neck_percent,
+         LAME = 100 - lame_percent) %>% 
+  
+  filter(BCS >= 0, HOCK >= 0, KNEE >= 0, NECK >= 0, LAME >= 0) %>%
+  
+  # Keeping only free-stall and tie-stall barns
+  filter(barn_type %in% c("Freestall", "Tiestall")) %>% 
+  
+  mutate_if(is.character, as.factor) %>% 
+  select(hrd_id, visit_date, milking, season, year, barn_type, BCS, HOCK,
+         KNEE, NECK, LAME)
+
+
+
+## Percentage of third or greater lactation cows ####
+
+hsi1 <- hsi %>% 
+  
+  # Assigning a more readable herd ID
+  drop_na(id) %>% 
+  left_join(unique_hrd_id, by = "id") %>% 
+  select(hrd_id, setdiff(names(hsi), c("id"))) %>% 
+  
+  
+  # Keeping only the last 12 months starting at the proAction evaluation
+  mutate(period = as.numeric(as.Date(visit_date, format = "%V-%m-%d") - 
+                               as.Date(test_date, format = "%V-%m-%d"))) %>%
+  filter(period <= 365.25) %>% 
+  
+  
+  # Keeping only herds with at least 3 tests over the 12 month period
+  # Creating variables to calculate the index
+  # Converting age at first calving from days to months
+  filter(cnttests >=3) %>% 
+  
+  mutate(avg_mortality_pcntg = (num_cow_dead_yr/avg_num_cows)*100) %>%  
+  
+  # Removing observations where percentage of involuntary culling is higher than 100%
+  # and lower than 0%
+  filter(involuntary_pcntg >= 0, involuntary_pcntg <= 100) %>% 
+  
+  # Keeping only age at first calving greater than or equal to 19 months
+  filter(age1stcalv >= 19) %>% 
+  
+  
+  # Calculating a final average per herd and removing herds with more than 3 variables
+  # with missing observations
+  select(-cnttests) %>% 
+  group_by(hrd_id) %>% 
+  summarise_if(is.numeric, mean, na.rm = T) %>% 
+  ungroup() %>% 
+  mutate(na = rowSums(is.na(.))) %>%
+  filter(na <= 3) %>% 
+  select(hrd_id, avg_pcntg_lgvt)
+  
+
+
+## Length of productive life data ####
+
+lpl1 <- lpl %>% 
+  
+  # Assigning a more readable herd ID
+  drop_na(id) %>% 
+  left_join(unique_hrd_id, by = "id") %>% 
+  
+  # Keeping only data from animals that left the herd in the last 12 months prior to 
+  # the proAction evaluation
+  mutate(period = as.numeric(as.Date(visit_date, format = "%V-%m-%d") - 
+                               as.Date(left_herd_date, format = "%V-%m-%d"))) %>%
+  filter(period <= 365.25) %>% 
+  
+  # Remove negative values on LPL
+  filter(prod_lt > 0) %>% 
+  
+  # Convert LPL to year
+  mutate(lpl = prod_lt/365.25) %>% 
+  select(hrd_id, lpl) %>% 
+  
+  group_by(hrd_id) %>% 
+  summarise(lpl = mean(lpl))
+
+
+
+## Production data ####
+
+# On research data, production and economics are provided by lactation
+# Some animals moved between herds. For those animals, I am keeping
+# production to the herd in which the cow finished her lactation
+
+research_data1 <- research_data %>% 
+  
+  # Assigning a more readable herd ID
+  drop_na(id) %>% 
+  left_join(unique_hrd_id, by = "id") %>% 
+  
+  # Keeping only data from animals that finished the lactation in the last 12 months prior to 
+  # the proAction evaluation
+  mutate(period = as.numeric(as.Date(visit_date, format = "%V-%m-%d") - 
+                               as.Date(lct_end_date, format = "%V-%m-%d"))) %>%
+  filter(period <= 365.25) %>% 
+  
+  
+  # Removing NAs on production variables because I need complete 
+  # obs to calculate ECM. Also, removing production values of ZERO
+  
+  # There are also some Zeros and NAs on milk value, despite having info
+  # on production. Removing this observations as well.
+  
+  drop_na(c(lact_date_yld_milk, lact_date_yld_fat,
+            lact_date_yld_prot, cumul_milk_value)) %>% 
+  
+  filter(lact_date_yld_milk != 0,
+         lact_date_yld_fat != 0,
+         lact_date_yld_prot != 0,
+         cumul_milk_value != 0) %>% 
+  
+  select(hrd_id, anm_id_anon, lact_date_yld_milk, lact_date_yld_fat, 
+         lact_date_yld_prot, cumul_milk_value) %>% 
+  
+  # Calculate ECM
+  mutate(ecm = 12.55*lact_date_yld_fat + 
+           7.39*lact_date_yld_prot + 
+           0.2595*lact_date_yld_milk) %>%
+  
+  # Calculate cumulative sum per animal in each herd (necessary because some animals
+  # moved between herds)
+  group_by(hrd_id, anm_id_anon) %>% 
+  summarise(across(everything(), sum)) %>% 
+  
+  
+  # Calculate cumulative herd average
+  select(-anm_id_anon) %>% 
+  group_by(hrd_id) %>% 
+  summarise_if(is.numeric, mean)
+
+
+## Calf survey data ####
+sv <- survey %>%
+  
+  # Assigning a more readable herd ID
+  drop_na(id) %>% 
+  left_join(unique_hrd_id, by = "id") %>% 
+  select(hrd_id, setdiff(names(survey), c("id"))) %>% 
+  
+  # Recorded date is in a format that does not work well with R
+  mutate(recorded_date = lubridate::date(recorded_date)) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  
+  # There are some empty cells, converting those to NA
+  na_if("") %>% 
+  droplevels() %>% 
+  
+  # removing repeated variables
+  select(-crh_cd, -fch_cd)
+
+
+
+# Exploring calf survey data
+summary(sv)
+
+# Exploring and potentially fixing missing observations
+DataExplorer::plot_missing(sv)
+
+
+# First round of cleaning
+
+sv1 <- sv %>%  
+  
+  # Removing observations on Organic farms
+  filter(regime == "Conventional") %>% 
+  
+  # Only interested in female calves. Therefore, removing the variables describing
+  # how male calves are treated differently than female.
+  select(-c(gender_management_ind, calf_management_reasons_1, calf_management_reasons_2,
+            calf_management_reasons_3, calf_management_reasons_4, calf_management_reasons_5)) %>%
+  
+  # There are too many missing observations on how the farmer check the criteria used for first
+  # breeding and weaning (estimated or measured/weighed). Removing this variables
+  select(-c(first_brdng_msrmnt_mthds, weaning_msrmnt_mthds)) %>%
+  
+  # There are also a considerable number of missing data on the amount of Fat and Protein
+  # of the milk replacer. Though the majority, not all farms fed milk replacer to calves.
+  # Imputing zero for those farms that did not and seeing if this reduce the amount of NAs
+  mutate(milk_replacer_fat_pcnt = ifelse(!is.na(calf_milk_sources) & 
+                                           calf_milk_sources != "Powdered milk replacer", 0,
+                                         milk_replacer_fat_pcnt),
+         milk_replacer_prt_pcnt = ifelse(!is.na(calf_milk_sources) & 
+                                           calf_milk_sources != "Powdered milk replacer", 0,
+                                         milk_replacer_prt_pcnt)) %>% 
+  
+  # There are farms which responded more than you type of bedding. Combining both into a single
+  # variable 
+  unite(calf_bedding_type, calf_bedding_type_1, calf_bedding_type_2,
+        na.rm = TRUE, remove = TRUE) %>% 
+  # There are some empty cells, converting those to NA
+  na_if("") %>% 
+  
+  # The variable frequency of adding bedding is on a lot of different units (per day, per week,
+  # and per month). Converting it to only months
+  
+  # Day to month = Frequency * 365.25 (days in the year) divided by 12 months
+  # Week to month = Frequency * (365.25/7) divided by 12 months
+  mutate(bdng_added_fqcy = ifelse(frequency_units == "month",
+                                  bdng_added_fqcy, 
+                                  ifelse(frequency_units == "week",
+                                         (bdng_added_fqcy*(365.25/7))/12, 
+                                         ifelse(frequency_units == "day",
+                                                (bdng_added_fqcy*365.25)/12, 
+                                                bdng_added_fqcy)))) %>% 
+  select(-frequency_units)
+
+
+
+sv1 %>% 
+  DataExplorer::plot_missing()
+
+
+sv1 %>% 
+  DataExplorer::plot_bar()
+
+
+
+sv2 <- sv1 %>% 
+  mutate_if(is.factor, as.character) %>% 
+  mutate(systraite = ifelse(systraite == "4. N/A", NA, systraite),
+         # There are too little farms with first colostrum from 7 to more than 12 hrs. Since colostrum is
+         # best only if fed in the first 6 hours, I am combining the least frequent levels
+         
+         first_colostrum_hrs = ifelse(first_colostrum_hrs %in% c("From 7 to 12hrs", 
+                                                                 "More than 12hrs"),
+                                      "More than 6hrs", first_colostrum_hrs),
+         # # Most farms do not evaluate colostrum IGG content. Therefore, the variable have too few
+         # # answers on levels other than "Not evaluated". Changing the variable to yes or no to evaluating 
+         # # colostrum IGG
+         # igg_conc_eval = ifelse(is.na(igg_conc_method), NA,
+         #                        ifelse(igg_conc_method == "Not evaluated", "no", "yes")),
+         
+         # calf_milk_feed_sys has too many levels with very little responses. Combining the least
+         # common answers to level "other"
+         calf_milk_feed_sys = ifelse(is.na(calf_milk_feed_sys), NA,
+                                     ifelse(!(calf_milk_feed_sys %in% c("Individual bucket with teats",
+                                                                        "Individual bucket without teats",
+                                                                        "Bottle",
+                                                                        "Automatique feeding system",
+                                                                        "Feed line (free feed)")),
+                                            "other", calf_milk_feed_sys)),
+         
+         # Very few farms answered weaning the animals "From 71 to 90" and "More than 90". Combining these
+         # answers to a new level "More than 70" 
+         weaning_age_days = ifelse(is.na(weaning_age_days), NA,
+                                   ifelse(weaning_age_days %in% c("From 71 to 90", "More than 90"),
+                                          "More than 70", weaning_age_days))
+         
+  ) %>% 
+  mutate_if(is.character, factor) %>% 
+  mutate_at(c("hrd_id"), factor) %>% 
+  mutate_at("starter_feed_prot_pcnts", as.character) %>% 
+  mutate_at("starter_feed_prot_pcnts", as.numeric)
+
+
+summary(sv2)
+
+# Checking categorical variables
+sv2 %>% 
+  DataExplorer::plot_bar()
+
+
+
+# Looking at the numerical variables
+sv2 %>% 
+  DataExplorer::plot_histogram()
+
+
+# Looking at correlations
+
+DataExplorer::plot_correlation(sv2,
+                               type = "continuous",
+                               cor_args = list(use = "pairwise.complete.obs"))
+
+DataExplorer::plot_correlation(sv2 %>% 
+                                 select(-c(hrd_id, systraite, regime, # only conventional 
+                                           recorded_date)),
+                               type = "discrete",
+                               cor_args = list(use = "pairwise.complete.obs"))
+
+
+sv3 <- sv2 %>% 
+  
+  # colostrum and milk meals are EXACTLY the same! Combining both
+  select(-milk_mealsperday) %>%
+  rename(colost_AND_milk_mealsperday = colostrum_mealsperday) %>% 
+  
+  # Some variables are ordered (e.g., Amount of colostrum). Format this variables
+  # correctly
+  mutate(calf_removal_hrs = factor(calf_removal_hrs,
+                                   levels = c("Less than 1hr", "1 to 6hrs", "7 to 12hrs", "13 to 24hrs",
+                                              "More than 24hrs"),
+                                   ordered = TRUE),
+         first_colostrum_hrs = factor(first_colostrum_hrs,
+                                      levels = c("Less than 1h after birth", "From 1 to 6hrs",
+                                                 "More than 6hrs"),
+                                      ordered = TRUE),
+         colost_AND_milk_mealsperday = factor(colost_AND_milk_mealsperday,
+                                              levels = c("1", "2", "3"),
+                                              ordered = TRUE),
+         first_colostrum_liters = factor(first_colostrum_liters,
+                                         levels = c("0 litre", "1 litre", "2 litres", 
+                                                    "3 litres", "4 litres or more"),
+                                         ordered = TRUE),
+         subs_colostrum_liters = factor(subs_colostrum_liters,
+                                         levels = c("0 litre", "1 litre", "2 litres", 
+                                                    "3 litres", "4 litres or more"),
+                                         ordered = TRUE),
+         weaning_age_days = factor(weaning_age_days,
+                                   levels = c("Less than 50", "From 51 to 70",
+                                              "More than 70"),
+                                   ordered = TRUE))
+  
+
+
+DataExplorer::plot_correlation(sv3 %>% 
+                                 select(-c(hrd_id, systraite, regime, # only conventional 
+                                           recorded_date)),
+                               type = "discrete",
+                               cor_args = list(use = "pairwise.complete.obs"))
+
+
+
+# Clustering early life management practices  -------------------------
+
+# Using the Gower distance because there are both categorical and numerical variables
+# Also, using the daisy function from the cluster package because it accepts NA
+
+
+clust.dist <- cluster::daisy(sv3 %>%
+                               select(-c(hrd_id, regime, # only conventional 
+                                                recorded_date, systraite)),
+                             metric = "gower")
+
+# Avaliando a dispersão das parcelas perdidas
+
+n.NA <- sv3 %>%
+  select(-c(hrd_id, regime, # only conventional 
+            recorded_date, systraite)) %>% 
+  summarise_all(~sum(is.na(.))) %>% 
+  reshape2::melt(value.name = "n.NA")
+
+n.NON_NA <- sv3 %>%
+  select(-c(hrd_id, regime, # only conventional 
+            recorded_date, systraite)) %>% 
+  summarise_all(~sum(!is.na(.))) %>% 
+  reshape2::melt(value.name = "non.NA")
+
+
+
+
+n.NA %>%
+  left_join(n.NON_NA, by = "variable") %>%
+  mutate(percNA = round((n.NA/as.integer(count(sv3)))*100, 1)) %>% View()
+
+## Cluster Validation ####
+
+# Jaccard's bootstrap distance
+# Hierarchical with Ward method
+
+valid.ward <- data.frame(NULL)
+
+for(i in 2:7) {
+  
+  cbv <- clusterboot(data = clust.dist,
+                     distances = TRUE,
+                     B = 100,
+                     bootmethod = "boot",
+                     clustermethod = disthclustCBI,
+                     noisemethod = FALSE,
+                     k = i,
+                     method = "ward.D2",
+                     seed = 1801,
+                     count = FALSE)
+  
+  
+  valid.ward <- valid.ward %>% 
+    rbind(data.frame(n_clusters = rep(cbv$nc, length(cbv$bootmean)),
+                     cluster_ID = c(1:length(cbv$bootmean)),
+                     jacard_boot = cbv$bootmean))
+  
+  print(
+    paste(i, " cluster finished. Only ", 7-i, " missing :)",
+          sep = "")
+  )
+  
+}
+
+
+# Partitioning around medoids
+
+valid.pam <- data.frame(NULL)
+
+for(i in 2:7){
+  
+  cbv <- clusterboot(data = clust.dist,
+                     distances = TRUE,
+                     B = 100,
+                     bootmethod = "boot",
+                     clustermethod = claraCBI,
+                     noisemethod = FALSE,
+                     k = i,
+                     usepam = TRUE,
+                     seed = 1801,
+                     count = FALSE)
+  
+  valid.pam <- valid.pam %>% 
+    rbind(data.frame(n_clusters = rep(cbv$nc, length(cbv$bootmean)),
+                     cluster_ID = c(1:length(cbv$bootmean)),
+                     jacard_boot = cbv$bootmean))
+  
+  print(
+    paste(i, " cluster finished. Only ", 7-i, " missing :)",
+          sep = "")
+  )
+  
+}
+
+
+# normal mixture model
+
+valid.mclust <- data.frame(NULL) 
+
+
+for(i in 2:7){
+  
+  cbv <- clusterboot(data = clust.dist,
+                     distances = TRUE,
+                     B = 100,
+                     bootmethod = "boot",
+                     clustermethod = distnoisemclustCBI,
+                     noisemethod = FALSE,
+                     k = i,
+                     seed = 1801,
+                     count = FALSE)
+  
+  valid.mclust <- valid.mclust %>% 
+    rbind(data.frame(n_clusters = rep(cbv$nc, length(cbv$bootmean)),
+                     cluster_ID = c(1:length(cbv$bootmean)),
+                     jacard_boot = cbv$bootmean))
+  
+  print(
+    paste(i, " cluster finished. Only ", 7-i, " missing :)",
+          sep = "")
+  )
+  
+}
+
+
+
+
+valid.ward %>% 
+  group_by(n_clusters) %>% 
+  summarise(avg_jacard = mean(jacard_boot),
+            sd_jacard = sd(jacard_boot)) %>% 
+  mutate_all(round, 3)
+
+valid.ward %>% 
+  mutate_all(round, 2) %>% View()
+
+
+
+
+valid.pam %>% 
+  group_by(n_clusters) %>% 
+  summarise(avg_jacard = mean(jacard_boot),
+            sd_jacard = sd(jacard_boot)) %>% 
+  mutate_all(round, 2)
+
+valid.pam %>% 
+  mutate_all(round, 2) %>%  View()
+
+
+
+
+valid.mclust %>% 
+  group_by(n_clusters) %>% 
+  summarise(avg_jacard = mean(jacard_boot),
+            sd_jacard = sd(jacard_boot)) %>% 
+  mutate_all(round, 3)
+
+valid.mclust %>%  
+  mutate_all(round, 2) %>%  View()
+
+
+
+# Normal mixture models with 2 clusters was the best option!
+
+## Clustering ####
+
+set.seed(1801)
+sv.cluster <- distnoisemclustCBI(dmatrix = clust.dist,
+                                 k = 2,
+                                 diss = TRUE)
+
+
+
+
+# Visualizing the clusters using MDS
+cluster_mds <- cmdscale(d = as.dist(clust.dist),
+                        k = 2, # First two dimensions
+                        eig = TRUE)
+                        
+
+ggplot(mapping = aes(x = cluster_mds$points[,1],
+                     y = cluster_mds$points[,2],
+                     color = factor(sv.cluster$partition),
+                     shape = factor(sv.cluster$partition))) +
+  geom_point() + 
+  scale_color_manual(values = c("#1F78B4", "#FF7F00")) +
+  
+  theme_bw(base_family = "Times New Roman") +
+  labs(x = "MDS1",
+       y = "MDS2",
+       shape = "Cluster",
+       colour = "Cluster") +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.06))) +
+
+  theme(axis.text = element_text(size = 10, color = "black"),
+        legend.text = element_text(size = 10, family = "Times New Roman"),
+        legend.position = c(0.91, 0.84),
+        legend.background = element_rect(fill = "white", color = "black"),
+        legend.justification="center",
+        axis.title.x = element_text(size = 10, 
+                                    margin = margin(t = 10, # top
+                                                    r = 0, # right 
+                                                    b = 0, # bottom
+                                                    l = 0)),  # left
+        axis.title.y = element_text(size = 10,
+                                    margin = margin(t = 0, # top
+                                                    r = 10, # right 
+                                                    b = 0, # bottom
+                                                    l = 0)),
+        legend.title.align = 0.5)
+
+
+
+table(sv.cluster$partition)
+
+
+
+## Describing clusters ####
+# In order to describe the clusters, I will use the v-test from the FactoMineR package.
+# It provides a straight forward way to identify which variables clearly describe a cluster compared to the 
+# population. However, it does not handle NA. Using the mice package to impute 
+# the missing variables before getting cluster descriptions 
+
+
+sv.imputed <- mice(data = sv3 %>%
+                     select(-c(hrd_id, regime, # only conventional 
+                               recorded_date, systraite)) %>% 
+                     mutate(cluster = factor(sv.cluster$partition)), 
+                   method = "rf",
+                   seed = 1801,
+                   m = 1,
+                   printFlag = TRUE)
+
+
+sv.imputed %>% 
+  mice::complete("long") %>%
+  summary()
+
+densityplot(sv.imputed)
+
+
+sv.cluster.desc <- FactoMineR::catdes(donnee = sv.imputed %>% 
+                                        mice::complete("long") %>% 
+                                        select(-.id, -.imp),
+                                      num.var = 34,
+                                      proba = 0.05)
+
+
+# Cluster 1
+
+sv.cluster.desc$category$`1` %>%
+  data.frame() %>%
+  rownames_to_column("variable") %>%
+  arrange(desc(v.test)) %>%
+  mutate_if(is.numeric, round, 2) %>%
+  head(10)
+
+
+sv.cluster.desc$quanti$`1` %>%
+  data.frame() %>%
+  rownames_to_column("variable") %>%
+  arrange(desc(v.test)) %>%
+  mutate_if(is.numeric, round, 3) %>%
+  head(10)
+
+
+
+
+# Cluster 2
+sv.cluster.desc$category$`2` %>%
+  data.frame() %>%
+  rownames_to_column("variable") %>%
+  arrange(desc(v.test)) %>%
+  mutate_if(is.numeric, round, 2) %>%
+  head(10)
+
+
+sv.cluster.desc$quanti$`2` %>%
+  data.frame() %>%
+  rownames_to_column("variable") %>%
+  arrange(v.test) %>%
+  mutate_if(is.numeric, round, 3) %>%
+  head(10)
+
+
+
+sv.imputed %>% 
+  mice::complete("long") %>% 
+  select(-.id, -.imp) %>%
+  select_if(is.numeric) %>% 
+  summarise_all(mean)
+
+
+sv.imputed %>% 
+  mice::complete("long") %>% 
+  select(-.id, -.imp) %>%
+  select_if(is.numeric) %>% 
+  summarise_all(sd) %>% 
+  round(2)
+
+
+
+sv.imputed %>% 
+  mice::complete("long") %>%
+  group_by(cluster) %>% 
+  summarise_at(c("first_concentrate_age_days", "bdng_added_fqcy", "first_water_age_days", 
+                 "starter_feed_prot_pcnts", "daily_feeding_amnt", "milk_replacer_fat_pcnt", 
+                 "milk_replacer_prt_pcnt"),
+         ~ mean(.x, na.rm = TRUE)) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+
+
+sv.imputed %>% 
+  mice::complete("long") %>%
+  group_by(cluster) %>% 
+  summarise_at(c("first_concentrate_age_days", "bdng_added_fqcy", "first_water_age_days", 
+                 "starter_feed_prot_pcnts", "daily_feeding_amnt", "milk_replacer_fat_pcnt", 
+                 "milk_replacer_prt_pcnt"),
+               ~ sd(.x, na.rm = TRUE)) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 2)
+
+
+
+
+
+
+# Evaluating the association between early life and herd longevity, productivity, and profitability  ------------------------------------------------
+
+# Creating data file
+
+wd1 <- sv3 %>% 
+  
+  mutate(cluster = factor(sv.cluster$partition), 
+         hrd_id = as.numeric(as.character(hrd_id))) %>% 
+  left_join(research_data1, by = "hrd_id") %>% 
+  left_join(hsi1 %>% 
+              select(hrd_id, avg_pcntg_lgvt),
+            by = "hrd_id") %>% 
+  rename(lact3plus = avg_pcntg_lgvt) %>% 
+  left_join(lpl1,
+            by = "hrd_id") %>%
+  drop_na(cumul_milk_value, ecm, lact3plus, lpl)
+
+
+
+# Exploring missing data
+n.NA.wd <- wd1 %>%
+  select(-c(hrd_id, regime, # only conventional 
+            recorded_date, systraite)) %>% 
+  filter(!(colostrum_sys %in% c("No colostrum offered", 
+                                "Other")), 
+         !(calf_milk_source_forms %in% c("Pasteurized / Acidified",
+                                         "Non pasturized / Acidified"))) %>% 
+  summarise_all(~sum(is.na(.))) %>% 
+  reshape2::melt(value.name = "n.NA")
+
+n.NON_NA.wd <- wd1 %>%
+  select(-c(hrd_id, regime, # only conventional 
+            recorded_date, systraite)) %>% 
+  filter(!(colostrum_sys %in% c("No colostrum offered", 
+                                "Other")), 
+         !(calf_milk_source_forms %in% c("Pasteurized / Acidified",
+                                         "Non pasturized / Acidified"))) %>% 
+  summarise_all(~sum(!is.na(.))) %>% 
+  reshape2::melt(value.name = "non.NA")
+
+
+
+
+n.NA.wd %>%
+  left_join(n.NON_NA.wd, by = "variable") %>%
+  mutate(percNA = round((n.NA/as.integer(count(wd1)))*100, 1)) %>% View()
+
+
+
+# Exploring missing observations
+DataExplorer::plot_missing(wd1)
+summary(wd1)
+
+
+
+ggplot(wd1, aes(x = cluster, y = HSI)) +
+  geom_boxplot()
+  
+ggplot(wd1, aes(x = cluster, y = ecm)) +
+  geom_boxplot()
+
+ggplot(wd1, aes(x = cluster, y = cumul_milk_value)) +
+  geom_boxplot()
+
+
+ggplot(wd1, aes(x = cluster, y = lact3plus)) +
+  geom_boxplot()
+
+ggplot(wd1, aes(x = cluster, y = lpl)) +
+  geom_boxplot()
+
+
+
+## Multiple imputation  ####
+
+# mice:::find.collinear(wd1)
+
+wd.imputed <- mice(data = wd1 %>%
+                     select(-c(hrd_id, systraite, regime, # only conventional 
+                               recorded_date)), 
+                   method = "rf",
+                   seed = 1801,
+                   m = 10,
+                   printFlag = TRUE)
+
+
+# inspect quality of imputations
+plot(wd.imputed)
+densityplot(wd.imputed)
+
+wd.imputed %>% 
+  mice::complete("long") %>% 
+  summary()
+
+sv3 %>% 
+  select_if(is.numeric) %>% 
+  names()
+
+
+
+# Length of productive life
+wd.lpl.imputed.stats <- wd.imputed %>% 
+  mice::complete("long") %>%
+  
+  # Some levels on colostrum system and milk source are too low (e.g., Only 1 farm said "No colostrum")
+  # Therefore, I will remove those levels
+  filter(!(colostrum_sys %in% c("No colostrum offered", 
+                                "Other")), 
+         !(calf_milk_source_forms %in% c("Pasteurized / Acidified",
+                                         "Non pasturized / Acidified"))) %>% 
+  droplevels() %>%
+  
+  
+  # Selecting variables based on top variables that described the clusters
+  select(c(.imp, lpl, 
+           
+           # Categorical variables
+           "weaned_housing_details", "colostrum_sys", "calf_milk_source_forms", 
+           "calf_milk_sources", "calf_milk_feed_sys", "noweaned_housing_groupings", 
+           "milk_replacer_medicated_ind", "noweaned_housing_details", 
+           "weaned_housing_groupings", "igg_conc_method",
+           
+           # Numeric variables
+           "first_concentrate_age_days", "bdng_added_fqcy", "first_water_age_days", 
+           "starter_feed_prot_pcnts", "daily_feeding_amnt", "milk_replacer_fat_pcnt", 
+           "milk_replacer_prt_pcnt"))
+
+
+
+# Percentage of cows on 3rd or greater lactations
+wd.lact3plus.imputed.stats <- wd.imputed %>% 
+  mice::complete("long") %>% 
+  
+  # Some levels on colostrum system and milk source are too low (e.g., Only 1 farm said "No colostrum")
+  # Therefore, I will remove those levels
+  filter(!(colostrum_sys %in% c("No colostrum offered", 
+                                "Other")), 
+         !(calf_milk_source_forms %in% c("Pasteurized / Acidified",
+                                         "Non pasturized / Acidified"))) %>% 
+  droplevels() %>%
+  
+  
+  # Selecting variables based on top variables that described the clusters
+  select(c(.imp, lact3plus, 
+           
+           # Categorical variables
+           "weaned_housing_details", "colostrum_sys", "calf_milk_source_forms", 
+           "calf_milk_sources", "calf_milk_feed_sys", "noweaned_housing_groupings", 
+           "milk_replacer_medicated_ind", "noweaned_housing_details", 
+           "weaned_housing_groupings", "igg_conc_method",
+           
+           # Numeric variables
+           "first_concentrate_age_days", "bdng_added_fqcy", "first_water_age_days", 
+           "starter_feed_prot_pcnts", "daily_feeding_amnt", "milk_replacer_fat_pcnt", 
+           "milk_replacer_prt_pcnt"))
+
+
+
+# Energy-corrected milk
+wd.ecm.imputed.stats <- wd.imputed %>% 
+  mice::complete("long") %>% 
+  
+  # Some levels on colostrum system and milk source are too low (e.g., Only 1 farm said "No colostrum")
+  # Therefore, I will remove those levels
+  # filter(!(colostrum_sys %in% c("No colostrum offered", 
+  #                               "Other")), 
+  #        !(calf_milk_source_forms %in% c("Pasteurized / Acidified",
+  #                                        "Non pasturized / Acidified"))) %>% 
+  droplevels() %>%
+  
+  
+  # Selecting variables based on top variables that described the clusters
+  select(c(.imp, ecm, 
+           
+           # Categorical variables
+           "weaned_housing_details", "colostrum_sys", "calf_milk_source_forms", 
+           "calf_milk_sources", "calf_milk_feed_sys", "noweaned_housing_groupings", 
+           "milk_replacer_medicated_ind", "noweaned_housing_details", 
+           "weaned_housing_groupings", "igg_conc_method",
+           
+           # Numeric variables
+           "first_concentrate_age_days", "bdng_added_fqcy", "first_water_age_days", 
+           "starter_feed_prot_pcnts", "daily_feeding_amnt", "milk_replacer_fat_pcnt", 
+           "milk_replacer_prt_pcnt"))
+
+
+
+# Milk value
+wd.cumul_milk_value.imputed.stats <- wd.imputed %>% 
+  mice::complete("long") %>% 
+  
+  # Some levels on colostrum system and milk source are too low (e.g., Only 1 farm said "No colostrum")
+  # Therefore, I will remove those levels
+  filter(!(colostrum_sys %in% c("No colostrum offered", 
+                                "Other")), 
+         !(calf_milk_source_forms %in% c("Pasteurized / Acidified",
+                                         "Non pasturized / Acidified"))) %>% 
+  droplevels() %>%
+  
+  
+  # Selecting variables based on top variables that described the clusters
+  select(c(.imp, cumul_milk_value, 
+           
+           # Categorical variables
+           "weaned_housing_details", "colostrum_sys", "calf_milk_source_forms", 
+           "calf_milk_sources", "calf_milk_feed_sys", "noweaned_housing_groupings", 
+           "milk_replacer_medicated_ind", "noweaned_housing_details", 
+           "weaned_housing_groupings", "igg_conc_method",
+           
+           # Numeric variables
+           "first_concentrate_age_days", "bdng_added_fqcy", "first_water_age_days", 
+           "starter_feed_prot_pcnts", "daily_feeding_amnt", "milk_replacer_fat_pcnt", 
+           "milk_replacer_prt_pcnt"))
+
+
+# Length of productive Life ------------------------------------------------
+
+# Exploratory graphs
+wd.lpl.imputed.stats %>% 
+  DataExplorer::plot_bar()
+
+wd.lpl.imputed.stats %>% 
+  DataExplorer::plot_histogram()
+
+wd.lpl.imputed.stats %>% 
+  DataExplorer::plot_correlation(type = "continuous")
+
+wd.lpl.imputed.stats %>% 
+  DataExplorer::plot_correlation(type = "discrete")
+
+
+
+## Splitting data ####
+wd.lpl.imput.train.split <- data.frame()
+wd.lpl.imput.val.split <- data.frame()
+
+for (i in 1:10) {
+  
+  data <- wd.lpl.imputed.stats %>%
+    filter(.imp == i)
+  
+  splitIndex <- splitTools::partition(data$lpl,
+                                      p = c(train = 0.80, valid = 0.20),
+                                      seed = 1801)
+  
+  wd.lpl.imput.train.split <- rbind(wd.lpl.imput.train.split,
+                                    data[splitIndex$train,])
+  
+  wd.lpl.imput.val.split <- rbind(wd.lpl.imput.val.split,
+                                  data[splitIndex$valid,])
+  
+}
+
+
+# Inspecting it
+summary(wd.lpl.imput.train.split %>% 
+          filter(.imp == 1))
+
+
+summary(wd.lpl.imput.val.split %>% 
+          filter(.imp == 1))
+
+
+
+## Sanity check ####
+# Training a classic mixed effect model for each of the imputed files
+
+
+r2.lpl.lm <- c()
+rmse.lpl.lm <- c()
+
+for(i in 1:10) {
+  
+  lpl.lm <- lm(lpl ~ .,
+               data = wd.lpl.imput.train.split %>% 
+                 filter(.imp == i) %>% 
+                 select(-.imp))
+  
+  anova(lpl.lm) %>% print()
+  
+  
+  r2.lpl.lm[i] <- caret::R2(pred = predict(lpl.lm,
+                                           wd.lpl.imput.val.split %>% 
+                                             filter(.imp == i)),
+                            obs = wd.lpl.imput.val.split %>% 
+                              filter(.imp == i) %>% 
+                              pull(lpl),
+                            formula = "corr")
+  
+  rmse.lpl.lm[i] <- caret::RMSE(pred = predict(lpl.lm,
+                                               wd.lpl.imput.val.split %>% 
+                                                 filter(.imp == i)),
+                                obs = wd.lpl.imput.val.split %>% 
+                                  filter(.imp == i) %>% 
+                                  pull(lpl))
+  
+}
+
+
+mean(r2.lpl.lm) %>% 
+  round(3)
+
+mean(rmse.lpl.lm) %>% 
+  round(3)
+
+
+
+
+## Training machine learning models ####
+
+# Generating seeds for the random processes
+number <- 5
+repeats <- 10
+
+
+set.seed(1801)
+seeds <- vector(mode = "list", length = (number*repeats+1))
+for(i in 1:(number*repeats)) seeds[[i]] <- sample.int(1000000, 27)
+
+# For the last model:
+seeds[[(number*repeats+1)]] <- sample.int(1000000, 1)
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            number = number,
+                            repeats = repeats,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            allowParallel = TRUE,
+                            verboseIter = FALSE,
+                            seeds = seeds)
+
+# Setting parallel clusters
+
+cl <- makePSOCKcluster(parallel::detectCores())
+registerDoParallel(cl, cores = parallel::detectCores())
+
+getDoParWorkers()
+
+
+
+### Classification and regression decision Tree ####
+
+lpl.tree.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.lpl.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  tree_lpl <- train(lpl ~ ., 
+                    data = data, 
+                    method = "rpart2",
+                    trControl = fit_control)
+  
+  lpl.tree.models[[i]] <- tree_lpl
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+
+### Gradient boosting machine ####
+
+lpl.gbm.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.lpl.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  gbm_lpl <- train(lpl ~ ., 
+                   data = data, 
+                   method = "gbm",
+                   trControl = fit_control)
+  
+  lpl.gbm.models[[i]] <- gbm_lpl
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+### Random Forest ####
+
+lpl.rf.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.lpl.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  rf_lpl <- train(lpl ~ ., 
+                  data = data, 
+                  method = "ranger",
+                  trControl = fit_control)
+  
+  lpl.rf.models[[i]] <- rf_lpl
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+
+
+### Support vector machine ####
+
+lpl.svm.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.lpl.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  svm_lpl <- train(lpl ~ ., 
+                   data = data, 
+                   method = "svmRadialSigma",
+                   trControl = fit_control)
+  
+  lpl.svm.models[[i]] <- svm_lpl
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+
+stopCluster(cl)
+
+
+
+##  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res.lpl <- data.frame()
+
+
+for(i in 1:10) {
+  
+  res.lpl <- rbind(res.lpl, 
+                   ModelEvaluation(models = lpl.tree.models,
+                                   target.variable = "lpl",
+                                   train.data = wd.lpl.imput.train.split,
+                                   validation.data = wd.lpl.imput.val.split,
+                                   model.name = "ctree",
+                                   imputation = i)) %>%
+    
+    rbind(ModelEvaluation(models = lpl.gbm.models,
+                          target.variable = "lpl",
+                          train.data = wd.lpl.imput.train.split,
+                          validation.data = wd.lpl.imput.val.split,
+                          model.name = "gbm",
+                          imputation = i)) %>%
+    
+    rbind(ModelEvaluation(models = lpl.rf.models,
+                          target.variable = "lpl",
+                          train.data = wd.lpl.imput.train.split,
+                          validation.data = wd.lpl.imput.val.split,
+                          model.name = "rf",
+                          imputation = i)) %>% 
+    
+    rbind(ModelEvaluation(models = lpl.svm.models,
+                          target.variable = "lpl",
+                          train.data = wd.lpl.imput.train.split,
+                          validation.data = wd.lpl.imput.val.split,
+                          model.name = "svm",
+                          imputation = i))
+  
+  
+}
+
+
+res.lpl %>% 
+  filter(data.set == "validation") %>%
+  group_by(model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  mutate_if(is.numeric, round, 3) %>% 
+  # filter(metric %in% c("r2", "RMSE")) %>%
+  arrange(desc(Mean))
+
+
+res.lpl %>% 
+  filter(data.set == "validation") %>%
+  group_by(model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  filter(metric != "r2") %>% 
+  group_by(metric) %>% 
+  slice_min(Mean)
+
+res.lpl %>% 
+  filter(data.set == "validation") %>%
+  group_by(model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  filter(metric == "r2") %>% 
+  group_by(metric) %>% 
+  slice_max(Mean)
+
+
+
+# Support vector machine was the best model!
+
+
+## Model interpretation ------------------------------------------------------
+
+# Creating predictors
+
+predictors.lpl <- list()
+
+for(i in 1:10) {
+  
+  plan("callr", workers = 14)
+  predictor <- Predictor$new(model = lpl.svm.models[[i]], 
+                             data = wd.lpl.imputed.stats %>% 
+                               filter(.imp == i) %>% 
+                               select(-.imp),
+                             y = "lpl")
+  
+  predictors.lpl[[i]] <- predictor
+  
+}
+
+
+
+
+### Variable importance ####
+
+
+var.imp.lpl <- data.frame()
+
+
+for(i in 1:10) {
+  
+  
+  plan("callr", workers = 14)
+  
+  set.seed(1801)
+  imp.lpl <- FeatureImp$new(predictors.lpl[[i]], loss = "rmse",
+                            compare = "ratio")
+  
+  var.imp.lpl <- imp.lpl$results %>% 
+    mutate(imputation = i) %>% 
+    rbind(var.imp.lpl)
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+# var.imp.lpl
+
+
+ggplot(var.imp.lpl %>%  
+         group_by(feature) %>% 
+         summarise(avg = mean(importance),
+                   sd = sd(importance)) %>% 
+         
+         # mutate(feature = recode(feature, serum_IgG_infrared = "Serum IgG",
+         #                         scours = "Scours",
+         #                         pneumonia = "Pneumonia",
+         #                         navel_inf = "Navel infection",
+         #                         hrd_id = "Herd",
+         #                         birth_year = "Birth year",
+         #                         birht_weight = "Birth weight",
+         #                         birth_season = "Birth season",
+         #                         antib_treat = "Antibiotic treatment")) %>%
+         arrange(desc(avg)),
+       aes(y = reorder(feature, + avg),
+           x = avg)) +
+  geom_point() +
+  geom_errorbar(aes(xmin = avg - sd, xmax = avg + sd), 
+                width = 0.2) +
+  theme_classic(base_family = "Times New Roman") + 
+  # scale_x_continuous(expand = expansion(mult = c(0, 0)),
+  #                    breaks = seq(1, 1.10, by = 0.02),
+  #                    limits = c(0.998, 1.1)) +
+  labs(x = "Variable importance") +
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 10,
+                                    margin = margin(t = 10, # top
+                                                    r = 0, # right
+                                                    b = 0, # bottom
+                                                    l = 0)))
+
+
+
+### Accumulated local effect ####
+
+ale.lpl.res <- list()
+
+
+for(i in 1:10) {
+  
+  
+  plan("callr", workers = 14)
+  
+  set.seed(1801)
+  ale.lpl <- FeatureEffects$new(predictors.lpl[[i]], method = "ale",
+                                grid.size = 50)
+  
+  ale.lpl.res[[i]] <- ale.lpl
+  
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+# ale.lpl.res[[1]] %>%
+#   plot()
+
+
+
+ale.lpl.res.compiled <- data.frame()
+
+for(i in 1:10){
+  
+  vars <- names(ale.lpl.res[[i]]$results)
+  
+  for(j in seq_along(vars)){
+    
+    ale.lpl.res.compiled <- ale.lpl.res[[i]]$results[j] %>%
+      unname %>% 
+      as.data.frame() %>% 
+      mutate(imp = i) %>% 
+      rbind(ale.lpl.res.compiled)
+    
+  }
+}
+
+
+
+
+# Percentage of 3rd or greater lactation cows ------------------------------------------------
+
+# Exploratory graphs
+wd.lact3plus.imputed.stats %>% 
+  DataExplorer::plot_bar()
+
+wd.lact3plus.imputed.stats %>% 
+  DataExplorer::plot_histogram()
+
+wd.lact3plus.imputed.stats %>% 
+  DataExplorer::plot_correlation(type = "continuous")
+
+wd.lact3plus.imputed.stats %>% 
+  DataExplorer::plot_correlation(type = "discrete")
+
+
+
+## Splitting data ####
+wd.lact3plus.imput.train.split <- data.frame()
+wd.lact3plus.imput.val.split <- data.frame()
+
+for (i in 1:10) {
+  
+  data <- wd.lact3plus.imputed.stats %>%
+    filter(.imp == i)
+  
+  splitIndex <- splitTools::partition(data$lact3plus,
+                                      p = c(train = 0.80, valid = 0.20),
+                                      seed = 1802)
+  
+  wd.lact3plus.imput.train.split <- rbind(wd.lact3plus.imput.train.split,
+                                          data[splitIndex$train,])
+  
+  wd.lact3plus.imput.val.split <- rbind(wd.lact3plus.imput.val.split,
+                                        data[splitIndex$valid,])
+  
+}
+
+
+# Inspecting it
+summary(wd.lact3plus.imput.train.split %>% 
+          filter(.imp == 10))
+
+
+summary(wd.lact3plus.imput.val.split %>% 
+          filter(.imp == 1))
+
+
+
+## Sanity check ####
+# Training a classic mixed effect model for each of the imputed files
+
+
+r2.lact3plus.lm <- c()
+rmse.lact3plus.lm <- c()
+
+for(i in 1:10) {
+  
+  lact3plus.lm <- lm(lact3plus ~ .,
+                     data = wd.lact3plus.imput.train.split %>% 
+                       filter(.imp == i) %>% 
+                       select(-.imp))
+  
+  anova(lact3plus.lm) %>% print()
+  
+  
+  r2.lact3plus.lm[i] <- caret::R2(pred = predict(lact3plus.lm,
+                                                 wd.lact3plus.imput.val.split %>% 
+                                                   filter(.imp == i)),
+                                  obs = wd.lact3plus.imput.val.split %>% 
+                                    filter(.imp == i) %>% 
+                                    pull(lact3plus),
+                                  formula = "corr")
+  
+  rmse.lact3plus.lm[i] <- caret::RMSE(pred = predict(lact3plus.lm,
+                                                     wd.lact3plus.imput.val.split %>% 
+                                                       filter(.imp == i)),
+                                      obs = wd.lact3plus.imput.val.split %>% 
+                                        filter(.imp == i) %>% 
+                                        pull(lact3plus))
+  
+}
+
+
+mean(r2.lact3plus.lm) %>% 
+  round(3)
+
+mean(rmse.lact3plus.lm) %>% 
+  round(3)
+
+
+
+
+## Training machine learning models ####
+
+# Generating seeds for the random processes
+number <- 5
+repeats <- 10
+
+
+set.seed(1801)
+seeds <- vector(mode = "list", length = (number*repeats+1))
+for(i in 1:(number*repeats)) seeds[[i]] <- sample.int(1000000, 27)
+
+# For the last model:
+seeds[[(number*repeats+1)]] <- sample.int(1000000, 1)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            number = number,
+                            repeats = repeats,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            allowParallel = TRUE,
+                            verboseIter = FALSE,
+                            seeds = seeds)
+
+
+# Setting parallel clusters
+
+cl <- makePSOCKcluster(parallel::detectCores())
+registerDoParallel(cl, cores = parallel::detectCores())
+
+getDoParWorkers()
+
+
+
+### Classification and regression decision Tree ####
+
+lact3plus.tree.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.lact3plus.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  tree_lact3plus <- train(lact3plus ~ ., 
+                          data = data, 
+                          method = "rpart2",
+                          trControl = fit_control)
+  
+  lact3plus.tree.models[[i]] <- tree_lact3plus
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+
+### Gradient boosting machine ####
+
+lact3plus.gbm.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.lact3plus.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  gbm_lact3plus <- train(lact3plus ~ ., 
+                         data = data, 
+                         method = "gbm",
+                         trControl = fit_control)
+  
+  lact3plus.gbm.models[[i]] <- gbm_lact3plus
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+### Random Forest ####
+
+lact3plus.rf.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.lact3plus.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  rf_lact3plus <- train(lact3plus ~ ., 
+                        data = data, 
+                        method = "ranger",
+                        trControl = fit_control)
+  
+  lact3plus.rf.models[[i]] <- rf_lact3plus
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+
+
+### Support vector machine ####
+
+lact3plus.svm.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.lact3plus.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  svm_lact3plus <- train(lact3plus ~ ., 
+                         data = data, 
+                         method = "svmRadialSigma",
+                         trControl = fit_control)
+  
+  lact3plus.svm.models[[i]] <- svm_lact3plus
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+
+stopCluster(cl)
+
+
+
+##  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res.lact3plus <- data.frame()
+
+
+for(i in 1:10) {
+  
+  res.lact3plus <- rbind(res.lact3plus, 
+                         
+                         # Decision tree model did not train (5 fold generated splits
+                         # where there were too little data on some levels)
+                         
+                         # ModelEvaluation(models = lact3plus.tree.models,
+                         #                 target.variable = "lact3plus",
+                         #                 train.data = wd.lact3plus.imput.train.split,
+                         #                 validation.data = wd.lact3plus.imput.val.split,
+                         #                 model.name = "ctree",
+                         #                 imputation = i)) %>%
+    
+    ModelEvaluation(models = lact3plus.gbm.models,
+                          target.variable = "lact3plus",
+                          train.data = wd.lact3plus.imput.train.split,
+                          validation.data = wd.lact3plus.imput.val.split,
+                          model.name = "gbm",
+                          imputation = i)) %>%
+    
+    rbind(ModelEvaluation(models = lact3plus.rf.models,
+                          target.variable = "lact3plus",
+                          train.data = wd.lact3plus.imput.train.split,
+                          validation.data = wd.lact3plus.imput.val.split,
+                          model.name = "rf",
+                          imputation = i)) %>% 
+    
+    rbind(ModelEvaluation(models = lact3plus.svm.models,
+                          target.variable = "lact3plus",
+                          train.data = wd.lact3plus.imput.train.split,
+                          validation.data = wd.lact3plus.imput.val.split,
+                          model.name = "svm",
+                          imputation = i))
+  
+  
+}
+
+
+res.lact3plus %>% 
+  filter(data.set == "validation") %>%
+  group_by(model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  mutate_if(is.numeric, round, 3) %>% 
+  # filter(metric %in% c("r2", "RMSE")) %>%
+  arrange(desc(Mean))
+
+
+
+res.lact3plus %>% 
+  filter(data.set == "validation") %>%
+  group_by(model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  filter(metric != "r2") %>% 
+  group_by(metric) %>% 
+  slice_min(Mean)
+
+res.lact3plus %>% 
+  filter(data.set == "validation") %>%
+  group_by(model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  filter(metric == "r2") %>% 
+  group_by(metric) %>% 
+  slice_max(Mean)
+
+
+
+
+# Random Forest was the best model!
+
+
+## Model interpretation ------------------------------------------------------
+
+# Creating predictors
+
+predictors.lact3plus <- list()
+
+for(i in 1:10) {
+  
+  plan("callr", workers = 14)
+  predictor <- Predictor$new(model = lact3plus.rf.models[[i]], 
+                             data = wd.lact3plus.imputed.stats %>% 
+                               filter(.imp == i) %>% 
+                               select(-.imp),
+                             y = "lact3plus")
+  
+  predictors.lact3plus[[i]] <- predictor
+  
+}
+
+
+
+
+### Variable importance ####
+
+
+var.imp.lact3plus <- data.frame()
+
+
+for(i in 1:10) {
+  
+  
+  plan("callr", workers = 14)
+  
+  set.seed(1801)
+  imp.lact3plus <- FeatureImp$new(predictors.lact3plus[[i]], loss = "rmse",
+                                  compare = "ratio")
+  
+  var.imp.lact3plus <- imp.lact3plus$results %>% 
+    mutate(imputation = i) %>% 
+    rbind(var.imp.lact3plus)
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+# var.imp.lact3plus
+
+
+ggplot(var.imp.lact3plus %>%  
+         group_by(feature) %>% 
+         summarise(avg = mean(importance),
+                   sd = sd(importance)) %>% 
+         
+         # mutate(feature = recode(feature, serum_IgG_infrared = "Serum IgG",
+         #                         scours = "Scours",
+         #                         pneumonia = "Pneumonia",
+         #                         navel_inf = "Navel infection",
+         #                         hrd_id = "Herd",
+         #                         birth_year = "Birth year",
+         #                         birht_weight = "Birth weight",
+         #                         birth_season = "Birth season",
+         #                         antib_treat = "Antibiotic treatment")) %>%
+         arrange(desc(avg)),
+       aes(y = reorder(feature, + avg),
+           x = avg)) +
+  geom_point() +
+  geom_errorbar(aes(xmin = avg - sd, xmax = avg + sd), 
+                width = 0.2) +
+  theme_classic(base_family = "Times New Roman") + 
+  # scale_x_continuous(expand = expansion(mult = c(0, 0)),
+  #                    breaks = seq(1, 1.10, by = 0.02),
+  #                    limits = c(0.998, 1.1)) +
+  labs(x = "Variable importance") +
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 10,
+                                    margin = margin(t = 10, # top
+                                                    r = 0, # right
+                                                    b = 0, # bottom
+                                                    l = 0)))
+
+
+
+### Accumulated local effect ####
+
+ale.lact3plus.res <- list()
+
+
+for(i in 1:10) {
+  
+  
+  plan("callr", workers = 14)
+  
+  set.seed(1801)
+  ale.lact3plus <- FeatureEffects$new(predictors.lact3plus[[i]], method = "ale",
+                                      grid.size = 50)
+  
+  ale.lact3plus.res[[i]] <- ale.lact3plus
+  
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+# ale.lact3plus.res[[1]] %>% 
+#   plot()
+
+
+
+ale.lact3plus.res.compiled <- data.frame()
+
+for(i in 1:10){
+  
+  vars <- names(ale.lact3plus.res[[i]]$results)
+  
+  for(j in seq_along(vars)){
+    
+    ale.lact3plus.res.compiled <- ale.lact3plus.res[[i]]$results[j] %>%
+      unname %>% 
+      as.data.frame() %>% 
+      mutate(imp = i) %>% 
+      rbind(ale.lact3plus.res.compiled)
+    
+  }
+}
+
+
+
+
+# ECM  ------------------------------------------------
+
+# Exploratory graphs
+wd.ecm.imputed.stats %>% 
+  DataExplorer::plot_bar()
+
+wd.ecm.imputed.stats %>% 
+  DataExplorer::plot_histogram()
+
+wd.ecm.imputed.stats %>% 
+  DataExplorer::plot_correlation(type = "continuous")
+
+wd.ecm.imputed.stats %>% 
+  DataExplorer::plot_correlation(type = "discrete")
+
+
+
+## Splitting data ####
+wd.ecm.imput.train.split <- data.frame()
+wd.ecm.imput.val.split <- data.frame()
+
+for (i in 1:10) {
+  
+  data <- wd.ecm.imputed.stats %>%
+    filter(.imp == i)
+  
+  splitIndex <- splitTools::partition(data$ecm,
+                                      p = c(train = 0.80, valid = 0.20),
+                                      seed = 1801)
+  
+  wd.ecm.imput.train.split <- rbind(wd.ecm.imput.train.split,
+                                    data[splitIndex$train,])
+  
+  wd.ecm.imput.val.split <- rbind(wd.ecm.imput.val.split,
+                                  data[splitIndex$valid,])
+  
+}
+
+
+# Inspecting it
+summary(wd.ecm.imput.train.split %>% 
+          filter(.imp == 1))
+
+
+summary(wd.ecm.imput.val.split %>% 
+          filter(.imp == 1))
+
+
+
+## Sanity check ####
+# Training a classic mixed effect model for each of the imputed files
+
+
+r2.ecm.lm <- c()
+rmse.ecm.lm <- c()
+
+for(i in 1:10) {
+  
+  ecm.lm <- lm(ecm ~ .,
+               data = wd.ecm.imput.train.split %>% 
+                 filter(.imp == i) %>% 
+                 select(-.imp))
+  
+  anova(ecm.lm) %>% print()
+  
+  
+  r2.ecm.lm[i] <- caret::R2(pred = predict(ecm.lm,
+                                           wd.ecm.imput.val.split %>% 
+                                             filter(.imp == i)),
+                            obs = wd.ecm.imput.val.split %>% 
+                              filter(.imp == i) %>% 
+                              pull(ecm),
+                            formula = "corr")
+  
+  rmse.ecm.lm[i] <- caret::RMSE(pred = predict(ecm.lm,
+                                               wd.ecm.imput.val.split %>% 
+                                                 filter(.imp == i)),
+                                obs = wd.ecm.imput.val.split %>% 
+                                  filter(.imp == i) %>% 
+                                  pull(ecm))
+  
+}
+
+
+mean(r2.ecm.lm) %>% 
+  round(2)
+
+mean(rmse.ecm.lm) %>% 
+  round(3)
+
+
+
+
+## Training machine learning models ####
+
+# Generating seeds for the random processes
+number <- 5
+repeats <- 10
+
+
+set.seed(1801)
+seeds <- vector(mode = "list", length = (number*repeats+1))
+for(i in 1:(number*repeats)) seeds[[i]] <- sample.int(1000000, 27)
+
+# For the last model:
+seeds[[(number*repeats+1)]] <- sample.int(1000000, 1)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            number = number,
+                            repeats = repeats,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            allowParallel = TRUE,
+                            verboseIter = FALSE,
+                            seeds = seeds)
+
+# Setting parallel clusters
+
+cl <- makePSOCKcluster(parallel::detectCores())
+registerDoParallel(cl, cores = parallel::detectCores())
+
+getDoParWorkers()
+
+
+
+### Classification and regression decision Tree ####
+
+ecm.tree.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.ecm.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  tree_ecm <- train(ecm ~ ., 
+                    data = data, 
+                    method = "rpart2",
+                    trControl = fit_control)
+  
+  ecm.tree.models[[i]] <- tree_ecm
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+
+### Gradient boosting machine ####
+
+ecm.gbm.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.ecm.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  gbm_ecm <- train(ecm ~ ., 
+                   data = data, 
+                   method = "gbm",
+                   trControl = fit_control)
+  
+  ecm.gbm.models[[i]] <- gbm_ecm
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+### Random Forest ####
+
+ecm.rf.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.ecm.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  rf_ecm <- train(ecm ~ ., 
+                  data = data, 
+                  method = "ranger",
+                  trControl = fit_control)
+  
+  ecm.rf.models[[i]] <- rf_ecm
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+
+
+### Support vector machine ####
+
+ecm.svm.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.ecm.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  svm_ecm <- train(ecm ~ ., 
+                   data = data, 
+                   method = "svmRadialSigma",
+                   trControl = fit_control)
+  
+  ecm.svm.models[[i]] <- svm_ecm
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+
+stopCluster(cl)
+
+
+
+##  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res.ecm <- data.frame()
+
+
+for(i in 1:10) {
+  
+  res.ecm <- rbind(res.ecm, 
+                   ModelEvaluation(models = ecm.tree.models,
+                                   target.variable = "ecm",
+                                   train.data = wd.ecm.imput.train.split,
+                                   validation.data = wd.ecm.imput.val.split,
+                                   model.name = "ctree",
+                                   imputation = i)) %>%
+    
+    rbind(ModelEvaluation(models = ecm.gbm.models,
+                          target.variable = "ecm",
+                          train.data = wd.ecm.imput.train.split,
+                          validation.data = wd.ecm.imput.val.split,
+                          model.name = "gbm",
+                          imputation = i)) %>%
+    
+    rbind(ModelEvaluation(models = ecm.rf.models,
+                          target.variable = "ecm",
+                          train.data = wd.ecm.imput.train.split,
+                          validation.data = wd.ecm.imput.val.split,
+                          model.name = "rf",
+                          imputation = i)) %>% 
+    
+    rbind(ModelEvaluation(models = ecm.svm.models,
+                          target.variable = "ecm",
+                          train.data = wd.ecm.imput.train.split,
+                          validation.data = wd.ecm.imput.val.split,
+                          model.name = "svm",
+                          imputation = i))
+  
+  
+}
+
+
+res.ecm %>% 
+  filter(data.set == "validation") %>%
+  group_by(model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  mutate_if(is.numeric, round, 3) %>% 
+  # filter(metric %in% c("r2", "RMSE")) %>%
+  arrange(desc(Mean))
+
+
+
+res.ecm %>% 
+  filter(data.set == "validation") %>%
+  group_by(model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  filter(metric != "r2") %>% 
+  group_by(metric) %>% 
+  slice_min(Mean)
+
+res.ecm %>% 
+  filter(data.set == "validation") %>%
+  group_by(model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  filter(metric == "r2") %>% 
+  group_by(metric) %>% 
+  slice_max(Mean)
+
+
+
+# Random forest was the best model!
+
+
+## Model interpretation ------------------------------------------------------
+
+# Creating predictors
+
+predictors.ecm <- list()
+
+for(i in 1:10) {
+  
+  plan("callr", workers = 14)
+  predictor <- Predictor$new(model = ecm.rf.models[[i]],
+                             data = wd.ecm.imputed.stats %>%
+                               filter(.imp == i) %>%
+                               select(-.imp),
+                             y = "ecm")
+  
+  predictors.ecm[[i]] <- predictor
+  
+}
+
+
+
+
+### Variable importance ####
+
+
+var.imp.ecm <- data.frame()
+
+
+for(i in 1:10) {
+  
+  
+  plan("callr", workers = 14)
+  
+  set.seed(1801)
+  imp.ecm <- FeatureImp$new(predictors.ecm[[i]], loss = "rmse",
+                            compare = "ratio")
+  
+  var.imp.ecm <- imp.ecm$results %>%
+    mutate(imputation = i) %>%
+    rbind(var.imp.ecm)
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+# var.imp.ecm
+
+
+ggplot(var.imp.ecm %>%
+         group_by(feature) %>%
+         summarise(avg = mean(importance),
+                   sd = sd(importance)) %>%
+         
+         # mutate(feature = recode(feature, serum_IgG_infrared = "Serum IgG",
+         #                         scours = "Scours",
+         #                         pneumonia = "Pneumonia",
+         #                         navel_inf = "Navel infection",
+         #                         hrd_id = "Herd",
+         #                         birth_year = "Birth year",
+         #                         birht_weight = "Birth weight",
+         #                         birth_season = "Birth season",
+         #                         antib_treat = "Antibiotic treatment")) %>%
+         arrange(desc(avg)),
+       aes(y = reorder(feature, + avg),
+           x = avg)) +
+  geom_point() +
+  geom_errorbar(aes(xmin = avg - sd, xmax = avg + sd),
+                width = 0.2) +
+  theme_classic(base_family = "Times New Roman") +
+  # scale_x_continuous(expand = expansion(mult = c(0, 0)),
+  #                    breaks = seq(1, 1.10, by = 0.02),
+  #                    limits = c(0.998, 1.1)) +
+  labs(x = "Variable importance") +
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 10,
+                                    margin = margin(t = 10, # top
+                                                    r = 0, # right
+                                                    b = 0, # bottom
+                                                    l = 0)))
+
+
+
+### Accumulated local effect ####
+
+ale.ecm.res <- list()
+
+
+for(i in 1:10) {
+  
+  
+  plan("callr", workers = 14)
+  
+  set.seed(1801)
+  ale.ecm <- FeatureEffects$new(predictors.ecm[[i]], method = "ale",
+                                grid.size = 50)
+  
+  ale.ecm.res[[i]] <- ale.ecm
+  
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+# ale.ecm.res[[1]] %>%
+#   plot()
+
+
+
+ale.ecm.res.compiled <- data.frame()
+
+for(i in 1:10){
+  
+  vars <- names(ale.ecm.res[[i]]$results)
+  
+  for(j in seq_along(vars)){
+    
+    ale.ecm.res.compiled <- ale.ecm.res[[i]]$results[j] %>%
+      unname %>%
+      as.data.frame() %>%
+      mutate(imp = i) %>%
+      rbind(ale.ecm.res.compiled)
+    
+  }
+}
+
+
+
+# Milk value  ------------------------------------------------
+
+# Exploratory graphs
+wd.cumul_milk_value.imputed.stats %>% 
+  DataExplorer::plot_bar()
+
+wd.cumul_milk_value.imputed.stats %>% 
+  DataExplorer::plot_histogram()
+
+wd.cumul_milk_value.imputed.stats %>% 
+  DataExplorer::plot_correlation(type = "continuous")
+
+wd.cumul_milk_value.imputed.stats %>% 
+  DataExplorer::plot_correlation(type = "discrete")
+
+
+
+## Splitting data ####
+wd.cumul_milk_value.imput.train.split <- data.frame()
+wd.cumul_milk_value.imput.val.split <- data.frame()
+
+for (i in 1:10) {
+  
+  data <- wd.cumul_milk_value.imputed.stats %>%
+    filter(.imp == i)
+  
+  splitIndex <- splitTools::partition(data$cumul_milk_value,
+                                      p = c(train = 0.80, valid = 0.20),
+                                      seed = 1801)
+  
+  wd.cumul_milk_value.imput.train.split <- rbind(wd.cumul_milk_value.imput.train.split,
+                                                 data[splitIndex$train,])
+  
+  wd.cumul_milk_value.imput.val.split <- rbind(wd.cumul_milk_value.imput.val.split,
+                                               data[splitIndex$valid,])
+  
+}
+
+
+# Inspecting it
+summary(wd.cumul_milk_value.imput.train.split %>% 
+          filter(.imp == 1))
+
+
+summary(wd.cumul_milk_value.imput.val.split %>% 
+          filter(.imp == 1))
+
+
+
+## Sanity check ####
+# Training a classic mixed effect model for each of the imputed files
+
+
+r2.cumul_milk_value.lm <- c()
+rmse.cumul_milk_value.lm <- c()
+
+for(i in 1:10) {
+  
+  cumul_milk_value.lm <- lm(cumul_milk_value ~ .,
+                            data = wd.cumul_milk_value.imput.train.split %>% 
+                              filter(.imp == i) %>% 
+                              select(-.imp))
+  
+  anova(cumul_milk_value.lm) %>% print()
+  
+  
+  r2.cumul_milk_value.lm[i] <- caret::R2(pred = predict(cumul_milk_value.lm,
+                                                        wd.cumul_milk_value.imput.val.split %>% 
+                                                          filter(.imp == i)),
+                                         obs = wd.cumul_milk_value.imput.val.split %>% 
+                                           filter(.imp == i) %>% 
+                                           pull(cumul_milk_value),
+                                         formula = "corr")
+  
+  rmse.cumul_milk_value.lm[i] <- caret::RMSE(pred = predict(cumul_milk_value.lm,
+                                                            wd.cumul_milk_value.imput.val.split %>% 
+                                                              filter(.imp == i)),
+                                             obs = wd.cumul_milk_value.imput.val.split %>% 
+                                               filter(.imp == i) %>% 
+                                               pull(cumul_milk_value))
+  
+}
+
+
+mean(r2.cumul_milk_value.lm) %>% 
+  round(2)
+
+mean(rmse.cumul_milk_value.lm) %>% 
+  round(3)
+
+
+
+
+## Training machine learning models ####
+
+# Generating seeds for the random processes
+number <- 5
+repeats <- 10
+
+
+set.seed(1801)
+seeds <- vector(mode = "list", length = (number*repeats+1))
+for(i in 1:(number*repeats)) seeds[[i]] <- sample.int(1000000, 27)
+
+# For the last model:
+seeds[[(number*repeats+1)]] <- sample.int(1000000, 1)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            number = number,
+                            repeats = repeats,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            allowParallel = TRUE,
+                            verboseIter = FALSE,
+                            seeds = seeds)
+
+
+# Setting parallel clusters
+
+cl <- makePSOCKcluster(parallel::detectCores())
+registerDoParallel(cl, cores = parallel::detectCores())
+
+getDoParWorkers()
+
+
+
+### Classification and regression decision Tree ####
+
+cumul_milk_value.tree.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.cumul_milk_value.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  tree_cumul_milk_value <- train(cumul_milk_value ~ ., 
+                                 data = data, 
+                                 method = "rpart2",
+                                 trControl = fit_control)
+  
+  cumul_milk_value.tree.models[[i]] <- tree_cumul_milk_value
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+
+### Gradient boosting machine ####
+
+cumul_milk_value.gbm.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.cumul_milk_value.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  gbm_cumul_milk_value <- train(cumul_milk_value ~ ., 
+                                data = data, 
+                                method = "gbm",
+                                trControl = fit_control)
+  
+  cumul_milk_value.gbm.models[[i]] <- gbm_cumul_milk_value
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+### Random Forest ####
+
+cumul_milk_value.rf.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.cumul_milk_value.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  rf_cumul_milk_value <- train(cumul_milk_value ~ ., 
+                               data = data, 
+                               method = "ranger",
+                               trControl = fit_control)
+  
+  cumul_milk_value.rf.models[[i]] <- rf_cumul_milk_value
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+
+
+### Support vector machine ####
+
+cumul_milk_value.svm.models <- list()
+
+
+for(i in 1:10) {
+  
+  
+  data <- wd.cumul_milk_value.imput.train.split %>% 
+    filter(.imp == i) %>% 
+    select(-.imp) %>% 
+    as.data.frame()
+  
+  
+  set.seed(1801)
+  svm_cumul_milk_value <- train(cumul_milk_value ~ ., 
+                                data = data, 
+                                method = "svmRadialSigma",
+                                trControl = fit_control)
+  
+  cumul_milk_value.svm.models[[i]] <- svm_cumul_milk_value
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+
+stopCluster(cl)
+
+
+
+##  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res.cumul_milk_value <- data.frame()
+
+
+for(i in 1:10) {
+  
+  res.cumul_milk_value <- rbind(res.cumul_milk_value, 
+                                ModelEvaluation(models = cumul_milk_value.tree.models,
+                                                target.variable = "cumul_milk_value",
+                                                train.data = wd.cumul_milk_value.imput.train.split,
+                                                validation.data = wd.cumul_milk_value.imput.val.split,
+                                                model.name = "ctree",
+                                                imputation = i)) %>%
+    
+    rbind(ModelEvaluation(models = cumul_milk_value.gbm.models,
+                          target.variable = "cumul_milk_value",
+                          train.data = wd.cumul_milk_value.imput.train.split,
+                          validation.data = wd.cumul_milk_value.imput.val.split,
+                          model.name = "gbm",
+                          imputation = i)) %>%
+    
+    rbind(ModelEvaluation(models = cumul_milk_value.rf.models,
+                          target.variable = "cumul_milk_value",
+                          train.data = wd.cumul_milk_value.imput.train.split,
+                          validation.data = wd.cumul_milk_value.imput.val.split,
+                          model.name = "rf",
+                          imputation = i)) %>% 
+    
+    rbind(ModelEvaluation(models = cumul_milk_value.svm.models,
+                          target.variable = "cumul_milk_value",
+                          train.data = wd.cumul_milk_value.imput.train.split,
+                          validation.data = wd.cumul_milk_value.imput.val.split,
+                          model.name = "svm",
+                          imputation = i))
+  
+  
+}
+
+
+res.cumul_milk_value %>% 
+  filter(data.set == "validation") %>%
+  group_by(model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 3) %>% 
+  # filter(metric %in% c("r2", "RMSE")) %>%
+  arrange(desc(Mean))
+
+
+
+res.cumul_milk_value %>% 
+  filter(data.set == "validation") %>%
+  group_by(model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  filter(metric != "r2") %>% 
+  group_by(metric) %>% 
+  slice_min(Mean)
+
+res.cumul_milk_value %>% 
+  filter(data.set == "validation") %>%
+  group_by(model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  filter(metric == "r2") %>% 
+  group_by(metric) %>% 
+  slice_max(Mean)
+
+
+
+# Random forest was the best model!
+
+
+## Model interpretation ------------------------------------------------------
+
+# Creating predictors
+
+predictors.cumul_milk_value <- list()
+
+for(i in 1:10) {
+  
+  plan("callr", workers = 14)
+  predictor <- Predictor$new(model = cumul_milk_value.rf.models[[i]],
+                             data = wd.cumul_milk_value.imputed.stats %>%
+                               filter(.imp == i) %>%
+                               select(-.imp),
+                             y = "cumul_milk_value")
+  
+  predictors.cumul_milk_value[[i]] <- predictor
+  
+}
+
+
+
+
+### Variable importance ####
+
+
+var.imp.cumul_milk_value <- data.frame()
+
+
+for(i in 1:10) {
+  
+  
+  plan("callr", workers = 14)
+  
+  set.seed(1801)
+  imp.cumul_milk_value <- FeatureImp$new(predictors.cumul_milk_value[[i]], loss = "rmse",
+                                         compare = "ratio")
+  
+  var.imp.cumul_milk_value <- imp.cumul_milk_value$results %>%
+    mutate(imputation = i) %>%
+    rbind(var.imp.cumul_milk_value)
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+# var.imp.cumul_milk_value
+
+
+ggplot(var.imp.cumul_milk_value %>%
+         group_by(feature) %>%
+         summarise(avg = mean(importance),
+                   sd = sd(importance)) %>%
+         
+         # mutate(feature = recode(feature, serum_IgG_infrared = "Serum IgG",
+         #                         scours = "Scours",
+         #                         pneumonia = "Pneumonia",
+         #                         navel_inf = "Navel infection",
+         #                         hrd_id = "Herd",
+         #                         birth_year = "Birth year",
+         #                         birht_weight = "Birth weight",
+         #                         birth_season = "Birth season",
+         #                         antib_treat = "Antibiotic treatment")) %>%
+         arrange(desc(avg)),
+       aes(y = reorder(feature, + avg),
+           x = avg)) +
+  geom_point() +
+  geom_errorbar(aes(xmin = avg - sd, xmax = avg + sd),
+                width = 0.2) +
+  theme_classic(base_family = "Times New Roman") +
+  # scale_x_continuous(expand = expansion(mult = c(0, 0)),
+  #                    breaks = seq(1, 1.10, by = 0.02),
+  #                    limits = c(0.998, 1.1)) +
+  labs(x = "Variable importance") +
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 10,
+                                    margin = margin(t = 10, # top
+                                                    r = 0, # right
+                                                    b = 0, # bottom
+                                                    l = 0)))
+
+
+
+### Accumulated local effect ####
+
+ale.cumul_milk_value.res <- list()
+
+
+for(i in 1:10) {
+  
+  
+  plan("callr", workers = 14)
+  
+  set.seed(1801)
+  ale.cumul_milk_value <- FeatureEffects$new(predictors.cumul_milk_value[[i]], method = "ale",
+                                             grid.size = 50)
+  
+  ale.cumul_milk_value.res[[i]] <- ale.cumul_milk_value
+  
+  
+  print(
+    paste(i, " imputed data set finished. Only ", 10-i, " sets missing :)",
+          sep = "")
+  )
+  
+  
+}
+
+
+# ale.cumul_milk_value.res[[1]] %>%
+#   plot()
+
+
+
+ale.cumul_milk_value.res.compiled <- data.frame()
+
+for(i in 1:10){
+  
+  vars <- names(ale.cumul_milk_value.res[[i]]$results)
+  
+  for(j in seq_along(vars)){
+    
+    ale.cumul_milk_value.res.compiled <- ale.cumul_milk_value.res[[i]]$results[j] %>%
+      unname %>%
+      as.data.frame() %>%
+      mutate(imp = i) %>%
+      rbind(ale.cumul_milk_value.res.compiled)
+    
+  }
+}
+
+
+# Final results -------------------------------------------------------------
+
+## Combined model performance ####
+performance.res <- res.lpl %>% 
+  mutate(outcome = "lpl") %>% 
+  
+  rbind(res.lact3plus %>% 
+          mutate(outcome = "lact3plus")) %>%
+  
+  rbind(res.ecm %>% 
+          mutate(outcome = "ecm")) %>% 
+  
+  rbind(res.cumul_milk_value %>% 
+          mutate(outcome = "mv")) %>% 
+  
+  
+  group_by(outcome, model, data.set, metric) %>% 
+  summarise(Mean = mean(value),
+            SD = sd(value)) %>% 
+  ungroup() %>% 
+  mutate(outcome = factor(outcome,
+                          levels = c("lpl","lact3plus", "ecm", "mv")),
+         metric = factor(metric,
+                         levels = c("r2", "RMSE", "MAE", "MAAPE")),
+         model = factor(model,
+                        levels = c("ctree", "gbm", "rf", "svm")))
+
+
+
+performance.res %>% 
+  filter(data.set == "training") %>% 
+  data.frame() %>% 
+  plyr::arrange(outcome, model, metric) %>% 
+  mutate_at("Mean", round, 1) %>% 
+  mutate_at("SD", round, 2) %>% 
+  rhandsontable::rhandsontable(useTypes = FALSE)
+
+
+performance.res %>% 
+  filter(data.set == "validation") %>%
+  data.frame() %>% 
+  plyr::arrange(outcome, model, metric) %>% 
+  mutate_at("Mean", round, 1) %>% 
+  mutate_at("SD", round, 2) %>% 
+  rhandsontable::rhandsontable(useTypes = FALSE)
+
+
+
+
+## Combined variable importance ####
+
+
+
+## Variable importance ####
+
+var.imp.res <- var.imp.lpl %>% 
+  mutate(outcome = "lpl") %>% 
+  
+  rbind(var.imp.lact3plus %>% 
+          mutate(outcome = "lact3plus")) %>%
+  
+  rbind(var.imp.ecm %>% 
+          mutate(outcome = "ecm")) %>% 
+  
+  rbind(var.imp.cumul_milk_value %>% 
+          mutate(outcome = "mv")) %>% 
+  
+  group_by(outcome, feature) %>% 
+  summarise(avg = mean(importance),
+            sd = sd(importance)) %>%  
+  
+  mutate(feature = dplyr::recode(feature, weaned_housing_details = "Weaned housing detail",
+                          colostrum_sys = "Colostrum feeding",
+                          calf_milk_source_forms = "Milk state",
+                          calf_milk_sources = "Milk source",
+                          calf_milk_feed_sys = "Milk feeding",
+                          milk_replacer_medicated_ind = "Milk replacer medicated",
+                          
+                          noweaned_housing_groupings = "Non-weaned housing",
+                          noweaned_housing_details = "Non-weaned housing detail",
+                          weaned_housing_groupings = "Weaned housing",
+                          
+                          igg_conc_method = "IgG concentration assessment",
+                          first_concentrate_age_days = "Age concentrate first offered",
+                          bdng_added_fqcy = "Frequency bedding addition",
+                          
+                          
+                          first_water_age_days = "Age water first offered",
+                          starter_feed_prot_pcnts = "Starter protein",
+                          daily_feeding_amnt = "Daily feeding amount",
+                          milk_replacer_fat_pcnt = "Milk replacer fat",
+                          milk_replacer_prt_pcnt = "Milk replacer protein"))
+
+
+
+varImp.plots <- plot_grid(
+  
+  ggplot(var.imp.res %>%
+           filter(outcome == "lpl") %>%
+           arrange(desc(avg)),
+         
+         aes(y = reorder(feature, + avg),
+             x = avg)) +
+    geom_point(size = 0.9) +
+    geom_errorbar(aes(xmin = avg - sd, xmax = avg + sd), 
+                  width = 0.2) +
+    theme_classic(base_family = "Times New Roman") + 
+    scale_x_continuous(expand = expansion(mult = c(0, 0)),
+                       breaks = seq(1, 1.008, by = 0.002),
+                       limits = c(1, 1.008)) +
+    labs(x = "Variable importance") +
+    theme_classic(base_family = "Times New Roman") +
+    theme(axis.text = element_text(size = 10, color = "black"),
+          axis.ticks.x = element_line(color = "black"),
+          axis.ticks.y = element_line(NA),
+          axis.line = element_line("black"),
+          axis.title.y = element_blank(),
+          axis.title.x = element_text(size = 10,
+                                      margin = margin(t = 10, # top
+                                                      r = 0, # right
+                                                      b = 0, # bottom
+                                                      l = 0))),
+  
+  ggplot(var.imp.res %>%
+           filter(outcome == "lact3plus") %>%
+           arrange(desc(avg)),
+         aes(y = reorder(feature, + avg),
+             x = avg)) +
+    geom_point(size = 0.9) +
+    geom_errorbar(aes(xmin = avg - sd, xmax = avg + sd), 
+                  width = 0.2) +
+    theme_classic(base_family = "Times New Roman") + 
+    scale_x_continuous(expand = expansion(mult = c(0, 0)),
+                       breaks = seq(1, 1.04, by = 0.01),
+                       limits = c(1, 1.04)) +
+    labs(x = "Variable importance") +
+    theme_classic(base_family = "Times New Roman") +
+    theme(axis.text = element_text(size = 10, color = "black"),
+          axis.ticks.x = element_line(color = "black"),
+          axis.ticks.y = element_line(NA),
+          axis.line = element_line("black"),
+          axis.title.y = element_blank(),
+          axis.title.x = element_text(size = 10,
+                                      margin = margin(t = 10, # top
+                                                      r = 0, # right
+                                                      b = 0, # bottom
+                                                      l = 0))),
+  
+  ggplot(var.imp.res %>%
+           filter(outcome == "ecm") %>%
+           arrange(desc(avg)),
+         aes(y = reorder(feature, + avg),
+             x = avg)) +
+    geom_point(size = 0.9) +
+    geom_errorbar(aes(xmin = avg - sd, xmax = avg + sd), 
+                  width = 0.2) +
+    theme_classic(base_family = "Times New Roman") + 
+    scale_x_continuous(expand = expansion(mult = c(0, 0)),
+                       breaks = seq(1, 1.05, by = 0.01),
+                       limits = c(1, 1.044)) +
+    labs(x = "Variable importance") +
+    theme_classic(base_family = "Times New Roman") +
+    theme(axis.text = element_text(size = 10, color = "black"),
+          axis.ticks.x = element_line(color = "black"),
+          axis.ticks.y = element_line(NA),
+          axis.line = element_line("black"),
+          axis.title.y = element_blank(),
+          axis.title.x = element_text(size = 10,
+                                      margin = margin(t = 10, # top
+                                                      r = 0, # right
+                                                      b = 0, # bottom
+                                                      l = 0))),
+  
+  ggplot(var.imp.res %>%
+           filter(outcome == "mv") %>%
+           arrange(desc(avg)),
+         aes(y = reorder(feature, + avg),
+             x = avg)) +
+    geom_point(size = 0.9) +
+    geom_errorbar(aes(xmin = avg - sd, xmax = avg + sd), 
+                  width = 0.2) +
+    theme_classic(base_family = "Times New Roman") + 
+    scale_x_continuous(expand = expansion(mult = c(0, 0)),
+                       breaks = seq(1, 1.04, by = 0.01),
+                       limits = c(1, 1.042)) +
+    labs(x = "Variable importance") +
+    theme_classic(base_family = "Times New Roman") +
+    theme(axis.text = element_text(size = 10, color = "black"),
+          axis.ticks.x = element_line(color = "black"),
+          axis.ticks.y = element_line(NA),
+          axis.line = element_line("black"),
+          axis.title.y = element_blank(),
+          axis.title.x = element_text(size = 10,
+                                      margin = margin(t = 10, # top
+                                                      r = 0, # right
+                                                      b = 0, # bottom
+                                                      l = 0))),
+  
+  
+  label_fontfamily = "Times New Roman",
+  nrow = 2,
+  labels = c("A", "B", "C", "D"),#, "E"),
+  label_size = 14,
+  scale = rep(0.97, 4))
+
+
+varImp.plots
+
+
+
+
+## Acumulated local effect ####
+
+var.factor <- c("weaned_housing_details", "colostrum_sys", "calf_milk_source_forms", 
+                "calf_milk_sources", "calf_milk_feed_sys", "noweaned_housing_groupings", 
+                "milk_replacer_medicated_ind", "noweaned_housing_details", 
+                "weaned_housing_groupings", "igg_conc_method")
+
+
+
+
+ale.res.compiled <- ale.lpl.res.compiled %>% 
+  mutate(outcome = "lpl") %>% 
+  rbind(ale.lact3plus.res.compiled %>% 
+          mutate(outcome = "lact3plus")) %>% 
+  rbind(ale.ecm.res.compiled %>% 
+          mutate(outcome = "ecm")) %>% 
+  rbind(ale.cumul_milk_value.res.compiled %>% 
+          mutate(outcome = "mv")) %>% 
+ungroup() %>% 
+  
+  mutate(outcome = factor(outcome,
+                          levels = c("lpl", "lact3plus", "ecm", "mv")),
+         .feature = factor(.feature,
+                           levels = c("colostrum_sys", "igg_conc_method",
+                                      "calf_milk_sources", "calf_milk_source_forms", 
+                                      "calf_milk_feed_sys", "milk_replacer_medicated_ind",
+                                      "noweaned_housing_details", "noweaned_housing_groupings",
+                                      "weaned_housing_details", "weaned_housing_groupings",
+                                      
+                                      # Numeric variables
+                                      "first_concentrate_age_days", "bdng_added_fqcy", "first_water_age_days", 
+                                      "starter_feed_prot_pcnts", "daily_feeding_amnt", "milk_replacer_fat_pcnt", 
+                                      "milk_replacer_prt_pcnt")))
+
+mult <- function(data, mult) { 
+  x <- data*mult
+  
+  return(x)}
+
+ale.res.compiled %>% 
+  filter(.feature == "calf_milk_source_forms", outcome == "mv") %>% 
+  group_by(outcome, .feature, .borders) %>% 
+  summarise(AVG = mean(.value),
+            SD = sd(.value)) %>% 
+  data.frame() %>% 
+  mutate_at("AVG", round, 1) %>%
+  mutate_at("SD", round, 2) %>%
+  rhandsontable::rhandsontable(useTypes = FALSE)
+
+
+
+# Quantitative variables
+
+# first_concentrate_age_days
+
+plot_grid(
+
+    ggplot(ale.res.compiled %>% 
+           filter(outcome == "ecm", .feature == "first_concentrate_age_days") %>% 
+           mutate(.borders = as.numeric(.borders)),
+         aes(x = .borders,
+             y = .value)) +
+    geom_line(aes(group = imp),
+              colour = "grey") +
+    geom_smooth(se = F)+
+    theme_classic(base_family = "Times New Roman") + 
+    scale_x_continuous(expand = expansion(mult = c(0.01, 0.01))) +
+    labs(x = "Age concentrate first offered (day)",
+         y = "Accumulated local effect") +
+    theme_classic(base_family = "Times New Roman") +
+    theme(axis.text = element_text(size = 10, color = "black"),
+          axis.ticks = element_line(color = "black"),
+          axis.line = element_line("black"),
+          axis.title.y = element_text(size = 10,
+                                      margin = margin(t = 0, # top
+                                                      r = 10, # right
+                                                      b = 0, # bottom
+                                                      l = 0)),
+          axis.title.x = element_text(size = 10,
+                                      margin = margin(t = 10, # top
+                                                      r = 0, # right
+                                                      b = 0, # bottom
+                                                      l = 0))),
+  
+  ggplot(ale.res.compiled %>% 
+           filter(outcome == "mv", .feature == "first_concentrate_age_days") %>% 
+           mutate(.borders = as.numeric(.borders)),
+         aes(x = .borders,
+             y = .value)) +
+    geom_line(aes(group = imp),
+              colour = "grey") +
+    geom_smooth(se = F)+
+    theme_classic(base_family = "Times New Roman") + 
+    scale_x_continuous(expand = expansion(mult = c(0.01, 0.01))) +
+    labs(x = "Age concentrate first offered (day)",
+         y = "Accumulated local effect") +
+    theme_classic(base_family = "Times New Roman") +
+    theme(axis.text = element_text(size = 10, color = "black"),
+          axis.ticks = element_line(color = "black"),
+          axis.line = element_line("black"),
+          axis.title.y = element_text(size = 10,
+                                      margin = margin(t = 0, # top
+                                                      r = 10, # right
+                                                      b = 0, # bottom
+                                                      l = 0)),
+          axis.title.x = element_text(size = 10,
+                                      margin = margin(t = 10, # top
+                                                      r = 0, # right
+                                                      b = 0, # bottom
+                                                      l = 0))),
+  
+  
+  label_fontfamily = "Times New Roman",
+  nrow = 2,
+  labels = c("A", "B"),
+  label_size = 14)
+
