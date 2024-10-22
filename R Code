@@ -1776,5 +1776,46 @@ with(wd.imputed,
          estimate = round(estimate, 2),
          std.error = round(std.error, 2))
 
+
+# Comparing herd longevity and performance between clusters ####
+
+aov(lpl ~ cluster, data = wd3) %>% 
+  anova()
+
+emmeans(aov(lpl ~ cluster, data = wd3), "cluster")
+
+
+
+aov(lact3plus ~ cluster, data = wd3) %>% 
+  anova()
+
+emmeans(aov(lact3plus ~ cluster, data = wd3), "cluster")
+
+
+
+aov(ecm ~ cluster, data = wd3) %>% 
+  anova()
+
+emmeans(aov(ecm ~ cluster, data = wd3), "cluster")
+
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarise(M = round(mean(ecm), 1)) %>% 
+  View()
+
+
+
+aov(cumul_milk_value ~ cluster, data = wd3) %>% 
+  anova()
+
+emmeans(aov(cumul_milk_value ~ cluster, data = wd3), "cluster")
+
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarise(M = round(mean(cumul_milk_value), 1)) %>% 
+  View()
+
+
 # THE END ####################################################################
+
 
